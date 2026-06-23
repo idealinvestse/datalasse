@@ -76,6 +76,21 @@ Other research-grade models to consider:
 - `openrouter/deepseek/deepseek-v4-flash` — budget research
 - `openrouter/minimax/minimax-m3` — fast, decent quality
 
+## Web search provider (Brave = primary)
+
+**Per 2026-06-23:** All `web_search` calls (main + subagents) go through Brave Search.
+
+- **Provider:** `tools.web.search.provider = "brave"` (`@openclaw/brave-plugin` v2026.6.5)
+- **API key:** `BRAVE_API_KEY` in `openclaw.json` `env.vars` (~1K queries/mo free credit)
+- **Parallel-free plugin** stays enabled as fallback
+- **Switch back:** `openclaw config set tools.web.search.provider parallel-free` (or unset for auto-detect)
+- **Verify:** `web_search` response includes `"provider": "brave"` field
+
+Research workflows using Brave (via `web_search`):
+- Main session research queries
+- Research subagents: deep-research, research-goal, research-watch, research-feedback, research-refresh, research-prioritize, research-discover
+- grok-build research-dispatcher (delegates to subagents)
+
 ---
 
 

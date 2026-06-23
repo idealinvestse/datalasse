@@ -1,36 +1,72 @@
 ---
 name: "brave-search"
-description: "Web search via Brave Search API. Use for independent search quota when OpenClaw's default is blocked or rate-limited."
+description: "Primary web search provider via Brave Search API. Use when web_search is called from research subagents, deep dives, or any research workflow."
 ---
 
-# Brave Search (updated 2026-06-22)
+# Brave Search (updated 2026-06-23)
 
-**Status:** Thin wrapper / alias around the built-in `web_search` tool.
+**Status:** **Primary** web_search provider for all research workflows.
 
-This skill provides an independent search quota via Brave Search when the OpenClaw default provider is rate-limited or blocked.
+The gateway uses `@openclaw/brave-plugin` (v2026.6.5, npm-installed) with
+`BRAVE_API_KEY` resolved from `~/.openclaw/openclaw.json` env block. Provider
+config lives at `plugins.entries.brave.config.webSearch` and `tools.web.search.provider = "brave"`.
 
-## Usage
+## Why Brave (not parallel-free)
 
-Use the standard `web_search` tool. When the default provider hits limits, this skill can be enabled as a fallback with its own Brave API quota.
+- Independent quota (Brave's $5/month free credit → ~1,000 queries/month free)
+- Better rate limits than Parallel free MCP
+- Structured results with snippets, country/language/freshness filters
+- LLM Context mode available for grounded queries (`webSearch.mode = "llm-context"`)
 
-## Gateway Integration
+## Where it's wired
 
-To enable as a first-class skill:
+- **Main session web_search** → Brave (primary)
+- **Research subagents** (deep-research, research-goal, research-watch, research-feedback, research-refresh, research-prioritize, research-discover) → inherit `web_search` from session → Brave
+- **grok-build research-dispatcher** → uses subagents → Brave
+- **Parallel (free)** plugin remains enabled as fallback for non-rate-limit-sensitive flows
 
-```json
+## Configuration
+
+```json5
 {
-  "skills": {
-    "entries": {
-      "brave-search": { "enabled": true }
-    }
-  }
+  plugins: {
+    entries: {
+      brave: {
+        enabled: true,
+        config: {
+          webSearch: {
+            mode: "web",          // or "llm-context"
+          },
+        },
+      },
+    },
+  },
+  tools: {
+    web: {
+      search: {
+        provider: "brave",
+        enabled: true,
+        maxResults: 7,
+        timeoutSeconds: 30,
+      },
+    },
+  },
 }
 ```
 
+`BRAVE_API_KEY` is resolved from `env.vars.BRAVE_API_KEY` in `openclaw.json`.
+
+## Switching back to fallback
+
+If Brave quota runs out, unset `tools.web.search.provider` to enter auto-detect
+mode (the next available provider key wins by precedence), or set it back to
+`"parallel-free"`.
+
 ## Notes
 
-- No standalone `scripts/brave_search.sh` exists.
-- The skill is intentionally lightweight — it reuses the existing `web_search` implementation.
-- Smoke test: `web_search` with a simple query should succeed when this entry is enabled.
+- Brave Search plan: $5 per 1,000 requests, with $5/month free credit (renewing)
+- Results cached 15 min by default
+- `brave.http` diagnostics flag available for troubleshooting (no API key in logs)
+- Set usage limit in Brave dashboard to avoid surprise charges: https://api-dashboard.search.brave.com
 
-**Last updated:** 2026-06-22 (structural audit)
+**Last updated:** 2026-06-23 (promoted to primary provider)
