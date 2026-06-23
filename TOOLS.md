@@ -100,6 +100,21 @@ Groq free: groq/compound, groq/compound-mini, gpt-oss-safeguard-20b
 - `GROQ_API_KEY` i `~/.config/moss/secrets-systemd.env` (mode 600)
 - Backup: `~/.openclaw/openclaw.json.bak.1782255296`
 
+## Git pushes (fine-grained PAT gotcha)
+
+**Workspace remote:** `https://github.com/idealinvestse/datalasse.git` (master, public)
+**Local bare mirror:** `/root/repos/openclaw-workspace.git` (always-synced backup)
+
+Fine-grained PATs (`github_pat_*`) do NOT work with `git credential helper` for push over HTTPS — only classic PATs or SSH keys do. Use URL-rewrite instead:
+
+```bash
+git -c "url.https://x-access-token:${GITHUB_TOKEN}@github.com/.insteadOf=https://github.com/" push origin master
+```
+
+`~/.bashrc.snippet` defines a `gitpush` wrapper that does this. Source it from `.bashrc` if desired — do NOT auto-modify `.bashrc` without owner approval.
+
+Also: fine-grained PATs **cannot create new repos via API** (no `Administration: write` scope). Create via UI, then push.
+
 ---
 ## Related
 
