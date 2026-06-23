@@ -1,0 +1,29 @@
+{
+  "port": 4023,
+  "mossRouter": {
+    "port": 4022,
+    "command": "node",
+    "script": "../moss-router/server.js",
+    "healthUrl": "http://127.0.0.1:4022/health"
+  },
+  "x402": {
+    "network": "eip155:84532",
+    "payTo": "0x000000000000000000000000000000000000dEaD",
+    "facilitatorUrl": "https://x402.org/facilitator"
+  },
+  "freeTier": {
+    "callsPerDay": 100
+  },
+  "tenant": {
+    "defaultSpendCapDaily": 5.00,
+    "defaultSpendCapMonthly": 50.00,
+    "rateLimitPerMin": 60
+  },
+  "pricing": {
+    "nano": 0.001,
+    "eco": 0.003,
+    "standard": 0.008,
+    "premium": 0.020,
+    "flagship": 0.050
+  }
+}

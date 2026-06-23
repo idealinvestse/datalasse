@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# report-template — returns standardized markdown report structure for deep-research synthesis
+#
+# Usage:
+#   bin/report-template standard
+#   bin/report-template           # same as standard
+#
+# Output: markdown skeleton (use in prompts to enforce consistent reports)
+
+set -euo pipefail
+
+TEMPLATE="${1:-standard}"
+
+case "$TEMPLATE" in
+  standard|default|"")
+    cat <<'TMPL'
+## Executive Summary
+- Bullet 1 (key finding)
+- Bullet 2 (key finding)
+- Bullet 3-5 (as needed)
+
+## Background & Context
+Provide 2-4 paragraphs of necessary context, history, and scope.
+
+## Findings
+### Sub-query 1: [query text]
+Key results and evidence...
+
+### Sub-query N: ...
+...
+
+## Synthesis
+Cross-cutting insights, patterns, contradictions, and implications. Weigh sources by credibility.
+
+## Sources
+1. [1⭐⭐⭐⭐⭐] https://... — short description
+2. [2⭐⭐⭐] https://... 
+(Use credibility badges. Only list cited sources.)
+
+## Confidence Audit
+(Added automatically by pipeline: per-claim scores + flags for unsourced assertions.)
+
+## Recommended Next Steps
+- Concrete actionable follow-ups (research or otherwise).
+TMPL
+    ;;
+  *)
+    echo "Unknown template: $TEMPLATE" >&2
+    echo "Available: standard" >&2
+    exit 1
+    ;;
+esac

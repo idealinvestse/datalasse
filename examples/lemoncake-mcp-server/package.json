@@ -1,0 +1,28 @@
+{
+  "name": "lemoncake-mcp-server",
+  "version": "0.1.0",
+  "description": "LemonCake MCP Server — x402 billable MCP tools (Phase 1 MVP on Base Sepolia testnet)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:bypass": "SKIP_PAYMENT=1 node server.js",
+    "test": "bash test-mcp-x402.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "x402",
+    "micropayments",
+    "usdc",
+    "base-sepolia",
+    "lemoncake",
+    "agentic-commerce"
+  ]
+}

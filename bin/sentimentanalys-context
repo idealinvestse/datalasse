@@ -1,0 +1,92 @@
+#!/usr/bin/env bash
+# sentimentanalys-context — quick helpers for the Automatisk-sentimentanalys project
+#
+# Usage:
+#   sentimentanalys-context cd       # cd into canonical repo dir
+#   sentimentanalys-context status    # git status + branch + last commit + working tree
+#   sentimentanalys-context plan      # show active plan file
+#   sentimentanalys-context docs      # list repo-internal agent docs to read
+#   sentimentanalys-context link      # ensure workspace symlink is healthy
+#   sentimentanalys-context bridge    # print the workspace CONTEXT.md path
+#   sentimentanalys-context open-pr   # create PR for current branch (uses gh)
+#   sentimentanalys-context (no arg)  # show this help
+
+set -euo pipefail
+
+REPO="$HOME/projects/Automatisk-sentimentanalys"
+WS_LINK="$HOME/.openclaw/workspace/projects/sentimentanalys"
+BRIDGE="$HOME/.openclaw/workspace/memory/projects/sentimentanalys/CONTEXT.md"
+PLAN_DIR="$HOME/.openclaw/workspace/memory/grok-plans"
+
+cmd="${1:-help}"
+
+case "$cmd" in
+  cd)
+    cd "$REPO" && exec "${SHELL:-bash}"
+    ;;
+  status)
+    cd "$REPO"
+    echo "=== repo: $REPO ==="
+    echo "branch: $(git branch --show-current)"
+    echo "remote: $(git remote get-url origin)"
+    echo "last commit: $(git log -1 --format='%h %s (%ai)')"
+    echo ""
+    echo "=== working tree ==="
+    git status --short | head -20 || echo "(clean)"
+    echo ""
+    echo "=== uncommitted diff stats ==="
+    git diff --stat HEAD 2>/dev/null | tail -5 || true
+    ;;
+  plan)
+    echo "=== active plan files for sentimentanalys ==="
+    ls -la "$PLAN_DIR"/2026-*sentimentanalys*.md 2>/dev/null || \
+      echo "(no plan files yet — see $BRIDGE for how to create)"
+    echo ""
+    LATEST=$(ls -t "$PLAN_DIR"/2026-*sentimentanalys*.md 2>/dev/null | head -1 || true)
+    if [ -n "$LATEST" ]; then
+      echo "=== latest: $LATEST ==="
+      head -40 "$LATEST"
+    fi
+    ;;
+  docs)
+    cd "$REPO"
+    echo "=== repo-internal agent docs (read these first) ==="
+    for f in AGENTS.md docs/LLM_AGENT_GUIDE.md docs/LLM_AGENT_QUICKREF.md \
+             docs/GROK_BUILD_PLAN_FAS1-3.md docs/ARCHITECTURE.md \
+             docs/SECURITY.md ROADMAP.md CHANGELOG.md; do
+      if [ -f "$f" ]; then
+        printf "  ✓ %s (%s)\n" "$f" "$(wc -l < "$f" | tr -d ' ') lines"
+      fi
+    done
+    ;;
+  link)
+    if [ -L "$WS_LINK" ] && [ "$(readlink "$WS_LINK")" = "$REPO" ]; then
+      echo "✓ symlink healthy: $WS_LINK → $REPO"
+    else
+      echo "✗ fixing symlink: $WS_LINK → $REPO"
+      mkdir -p "$(dirname "$WS_LINK")"
+      ln -sfn "$REPO" "$WS_LINK"
+    fi
+    ;;
+  bridge)
+    echo "$BRIDGE"
+    ;;
+  open-pr)
+    cd "$REPO"
+    if ! command -v gh >/dev/null 2>&1; then
+      echo "✗ gh CLI not installed"; exit 1
+    fi
+    BR=$(git branch --show-current)
+    if [ "$BR" = "main" ]; then
+      echo "✗ refusing to open PR from main"; exit 1
+    fi
+    gh pr create --base main --head "$BR" --fill
+    ;;
+  help|--help|-h|"")
+    sed -n '2,20p' "$0"
+    ;;
+  *)
+    echo "Unknown command: $cmd" >&2
+    exit 1
+    ;;
+esac

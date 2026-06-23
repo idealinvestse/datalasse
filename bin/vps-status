@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# bin/vps-status
+# Compact color-coded Ubuntu VPS status report (CPU, mem, disk, net, procs, PSI, services, uptime).
+# Read-only, no sudo, fail-graceful. Pure bash + coreutils/procps.
+#
+# Usage examples:
+#   bin/vps-status
+#   bin/vps-status --section=cpu --no-color
+#   bin/vps-status --json | python3 -m json.tool
+#   bin/vps-status --top 5 --watch=2
+#
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "${SCRIPT_DIR}/../lib/vps-status" 2>/dev/null && pwd || echo "")"
+
+# Defaults
+TOP_N=8
+SECTION="all"
+USE_COLOR=1
+JSON=0
+WATCH=""
+NO_COLOR_FLAG=0
+
+# Load helpers (relative)
+if [[ -n "$LIB_DIR" && -d "$LIB_DIR" ]]; then
+  # shellcheck disable=SC1091
+  [[ -f "$LIB_DIR/colors.sh" ]] && source "$LIB_DIR/colors.sh"
+  # shellcheck disable=SC1091
+  [[ -f "$LIB_DIR/readers.sh" ]] && source "$LIB_DIR/readers.sh"
+else
+  echo "ERROR: lib/vps-status/ helpers not found (expected next to bin/)" >&2
+  exit 1
+fi
+
+usage() {
+  cat <<'EOF'
+vps-status — compact local VPS health snapshot (like glances/top subset)
+
+Usage:
+  bin/vps-status [OPTIONS]
+
+Options:
+  --json                 Machine readable JSON (full structure or subtree if --section)
+  --section=NAME         cpu|mem|disk|net|procs|psi|uptime|svc|all (default all)
+  --top N                Number of processes to show (default 8)
+  --no-color             Disable ANSI colors
+  --watch=SECONDS        Repeat every N seconds (Ctrl-C to stop)
+  -h, --help             Show this help
+
+Sections (text):
+  Header always shown unless section limits.
+  cpu    : total%, per-core, loadavg, cpu PSI
+  mem    : total/used/avail/buf/cache, swap, mem PSI
+  disk   : df mounts (filtered), io PSI
+  net    : per-nic rx/tx, IPv4, gw
+  procs  : top-N CPU + top-N MEM (ps)
+  psi    : all pressure (cpu/mem/io)
+  uptime : formatted uptime + boot
+  svc    : active/failed service counts
+
+JSON structure:
+  { "host": {...}, "cpu": {...}, "memory": {...}, "disk": [...],
+    "net": [...], "processes": {"cpu":[...],"mem":[...]},
+    "psi": {...}, "services": {...}, "uptime_s": N, "boot_at": "ISO" }
+
+Exit codes:
+  0  success
+  1  usage error or fatal
+
+Security: read-only (/proc + non-priv cmds). No writes, no sudo, no network.
+Graceful: missing data -> "n/a" or partial output. Idempotent snapshots.
+EOF
+}
+
+# Arg parse (support --flag=value rewrite)
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --section=*|--top=*|--watch=*)
+      set -- "${1%%=*}" "${1#*=}" "${@:2}"
+      ;;
+  esac
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --json)
+      JSON=1
+      shift
+      continue
+      ;;
+    --section)
+      [[ $# -ge 2 ]] || { echo "ERROR: --section requires name" >&2; exit 1; }
+      SECTION="${2%%,*}"   # support csv by taking first (single per spec)
+      shift 2
+      continue
+      ;;
+    --top)
+      [[ $# -ge 2 ]] || { echo "ERROR: --top requires N" >&2; exit 1; }
+      TOP_N="$2"
+      shift 2
+      continue
+      ;;
+    --no-color)
+      NO_COLOR_FLAG=1
+      USE_COLOR=0
+      shift
+      continue
+      ;;
+
+    --watch)
+      [[ $# -ge 2 ]] || { echo "ERROR: --watch requires seconds" >&2; exit 1; }
+      WATCH="$2"
+      shift 2
+      continue
+      ;;
+    *)
+      echo "ERROR: unknown arg $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+# Apply no-color
+if (( NO_COLOR_FLAG )); then
+  USE_COLOR=0
+fi
+
+# Validate --section early (so both text and json paths exit 1 on bad input)
+case "$SECTION" in
+  cpu|mem|memory|disk|net|procs|processes|psi|svc|services|uptime|all|"") ;;
+  *)
+    echo "ERROR: unknown section: $SECTION (valid: cpu|mem|disk|net|procs|psi|svc|uptime|all)" >&2
+    usage >&2
+    exit 1
+    ;;
+esac
+
+# Data collection wrapper
+do_collect() {
+  collect_all
+}
+
+# Render one or all sections (text)
+render_section() {
+  local sec="$1"
+  case "$sec" in
+    cpu)   render_cpu ;;
+    mem|memory) render_memory ;;
+    disk)  render_disk ;;
+    net)   render_net ;;
+    procs|processes) render_procs "$TOP_N" ;;
+    psi)   printf '%s\n' "$(colorize "=== PSI ===" ok)"; printf 'cpu some/full: %s / %s\nmem some/full: %s / %s\nio  some/full: %s / %s\n' "$CPU_PSI_SOME" "$CPU_PSI_FULL" "$MEM_PSI_SOME" "$MEM_PSI_FULL" "$IO_PSI_SOME" "$IO_PSI_FULL" ;;
+    svc|services) render_services ;;
+    uptime) render_uptime ;;
+    all|"")
+      render_header
+      render_cpu
+      render_memory
+      render_disk
+      render_net
+      render_procs "$TOP_N"
+      render_services
+      ;;
+    *)
+      echo "unknown section: $sec" >&2
+      return 1
+      ;;
+  esac
+}
+
+# Main report (text)
+do_report() {
+  do_collect
+  if [[ "$SECTION" == "all" ]]; then
+    render_section all
+  else
+    # still show minimal header for context on single section
+    if [[ "$SECTION" != "uptime" ]]; then
+      printf 'host:%s uptime:%s snapshot:%s\n' "$HOSTNAME" "$UPTIME_PRETTY" "$SNAPSHOT_AT"
+    fi
+    if ! render_section "$SECTION"; then
+      echo "ERROR: section render failed: $SECTION" >&2
+      exit 1
+    fi
+  fi
+}
+
+# JSON path (filtered by --section if set; pure-bash main build)
+do_json() {
+  do_collect
+  if [[ "$SECTION" == "all" || -z "$SECTION" ]]; then
+    build_json
+  else
+    # Sub-tree: try get_section_json (uses python if available, falls back to full)
+    local sub
+    sub="$(get_section_json "$SECTION" 2>/dev/null || true)"
+    if [[ -z "$sub" || "$sub" == "{}" || "$sub" == "[]" ]]; then
+      # python missing or extraction failed -> emit full JSON
+      build_json
+    else
+      printf '%s' "$sub"
+    fi
+  fi
+  printf '\n'
+}
+
+# Clear helper (portable)
+clear_screen() {
+  if [[ -t 1 ]]; then
+    printf '\033[H\033[2J' || clear || printf '\n---\n'
+  else
+    printf '\n--- refresh ---\n'
+  fi
+}
+
+# Main dispatch
+main() {
+  if (( JSON )); then
+    if [[ -n "$WATCH" ]]; then
+      # watch + json: emit repeated objects (one per interval)
+      trap 'echo; exit 0' INT TERM
+      while :; do
+        do_json
+        sleep "$WATCH"
+      done
+    else
+      do_json
+    fi
+    return
+  fi
+
+  # text path
+  if [[ -n "$WATCH" ]]; then
+    trap 'echo "vps-status watch stopped"; exit 0' INT TERM
+    while :; do
+      clear_screen
+      do_report
+      sleep "$WATCH"
+    done
+  else
+    do_report
+  fi
+}
+
+main "$@"

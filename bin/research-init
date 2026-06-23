@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# research-init — one-time idempotent setup for research state directory
+#
+# Usage:
+#   bin/research-init          # idempotent setup (keeps existing data)
+#   bin/research-init --reset  # full reset (clears runs/, plans/, all jsonl)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+if [ "${1:-}" = "--reset" ]; then
+  rm -rf "$RESEARCH_DIR"
+  echo "Research state reset: $RESEARCH_DIR"
+fi
+
+research_ensure_dirs
+
+echo "Research state ready: $RESEARCH_DIR"
+ls -la "$RESEARCH_DIR" "$RUNS_DIR" "$PLANS_DIR"

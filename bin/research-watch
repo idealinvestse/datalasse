@@ -1,0 +1,184 @@
+#!/usr/bin/env bash
+# research-watch — autonomous loop for pending plan step-questions
+#
+# Usage:
+#   bin/research-watch --all              # list all pending steps (dry-run)
+#   bin/research-watch --due              # only steps due now (next_run absent or past)
+#   bin/research-watch --due --exec       # run deep-research for each due step
+#   bin/research-watch --goal=<id> --all    # restrict to one goal
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+DEEP_RESEARCH_BIN="${DEEP_RESEARCH_BIN:-$SCRIPT_DIR/deep-research}"
+
+ALL_MODE=1
+DUE_ONLY=0
+EXEC_MODE=0
+GOAL_FILTER=""
+
+usage() {
+  sed -n '3,9p' "$0"
+  echo ""
+  echo "Flags:"
+  echo "  --all       Include all pending steps (ignore next_run scheduling)"
+  echo "  --due       Only steps where next_run is absent or <= now"
+  echo "  --exec      Invoke deep-research (default: dry-run list only)"
+  echo "  --goal=ID   Restrict to one goal"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --all)      ALL_MODE=1; DUE_ONLY=0 ;;
+    --due)      DUE_ONLY=1; ALL_MODE=0 ;;
+    --exec)     EXEC_MODE=1 ;;
+    --goal=*)   GOAL_FILTER="${1#*=}" ;;
+    --help|-h)  usage; exit 0 ;;
+    *) echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+  esac
+  shift
+done
+
+research_ensure_dirs
+
+now_iso() {
+  date -u +%Y-%m-%dT%H:%M:%SZ
+}
+
+now_plus_hours() {
+  local h="$1"
+  date -u -d "+${h} hours" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -v+"${h}"H +%Y-%m-%dT%H:%M:%SZ
+}
+
+is_step_due() {
+  local goal_id="$1"
+  local step_id="$2"
+  local state next_run
+  state=$(watch_state_read)
+  next_run=$(echo "$state" | jq -r --arg gid "$goal_id" --arg sid "$step_id" \
+    '.[$gid][$sid].next_run // empty')
+  if [ -z "$next_run" ] || [ "$next_run" = "null" ]; then
+    return 0
+  fi
+  if [[ "$next_run" > "$(now_iso)" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+collect_pending() {
+  local goals filter
+  goals=$(goals_read_json | jq '[.[] | select(.status == "active")]')
+  if [ -n "$GOAL_FILTER" ]; then
+    goals=$(echo "$goals" | jq --arg gid "$GOAL_FILTER" '[.[] | select(.id == $gid)]')
+  fi
+
+  local pending='[]'
+  while IFS= read -r goal; do
+    [ -n "$goal" ] || continue
+    local gid plan_path completed steps
+    gid=$(echo "$goal" | jq -r '.id')
+    plan_path=$(plan_path_for "$gid")
+    [ -f "$plan_path" ] || continue
+
+    completed=$(goal_completed_step_ids "$gid")
+    steps=$(plan_parse_steps "$plan_path" "$gid")
+
+    while IFS= read -r step; do
+      [ -n "$step" ] || continue
+      local sid question
+      sid=$(echo "$step" | jq -r '.step_id')
+      question=$(echo "$step" | jq -r '.question')
+
+      if echo "$completed" | jq -e --arg sid "$sid" 'index($sid) != null' >/dev/null; then
+        continue
+      fi
+
+      if [ "$DUE_ONLY" -eq 1 ] && ! is_step_due "$gid" "$sid"; then
+        continue
+      fi
+
+      pending=$(echo "$pending" | jq --arg gid "$gid" --arg sid "$sid" --arg q "$question" \
+        '. + [{goal_id: $gid, step_id: $sid, question: $q}]')
+    done < <(echo "$steps" | jq -c '.[]')
+  done < <(echo "$goals" | jq -c '.[]')
+
+  echo "$pending"
+}
+
+ts_human=$(date -u '+%Y-%m-%d %H:%M UTC')
+echo "🔍 Research watch — $ts_human"
+echo ""
+
+PENDING=$(collect_pending)
+COUNT=$(echo "$PENDING" | jq 'length')
+
+if [ "$COUNT" -eq 0 ]; then
+  echo "No pending step-questions."
+  exit 0
+fi
+
+echo "Found $COUNT pending step-question(s):"
+echo "$PENDING" | jq -r '.[] | "  \(.goal_id): \"\(.question)\""'
+echo ""
+
+if [ "$EXEC_MODE" -eq 0 ]; then
+  exit 0
+fi
+
+echo "Running $COUNT deep-research run(s) (this may take 5-15 min)..."
+echo ""
+
+FAILURES=0
+while IFS= read -r item; do
+  [ -n "$item" ] || continue
+  gid=$(echo "$item" | jq -r '.goal_id')
+  sid=$(echo "$item" | jq -r '.step_id')
+  question=$(echo "$item" | jq -r '.question')
+  ts=$(date -u +%Y%m%d-%H%M%S)
+  out="/tmp/deep-research-auto-${ts}.md"
+  attempt_ts=$(now_iso)
+
+  set +e
+  dr_out=$("$DEEP_RESEARCH_BIN" "$question" \
+    --goal="$gid" \
+    --mark-step="$sid" \
+    --depth=auto \
+    --budget=0.20 \
+    --output="$out" 2>&1)
+  dr_code=$?
+  set -e
+
+  if [ "$dr_code" -eq 0 ]; then
+    run_id=$(ls -t "$RUNS_DIR"/*.json 2>/dev/null | head -1 | xargs -r basename | sed 's/.json$//')
+    cost="0.00"
+    stages="0"
+    sources="0"
+    if [ -n "${run_id:-}" ] && [ -f "$RUNS_DIR/${run_id}.json" ]; then
+      cost=$(jq -r '.cost // 0' "$RUNS_DIR/${run_id}.json")
+      stages=$(jq -r '.stages_run // 0' "$RUNS_DIR/${run_id}.json")
+      sources=$(jq -r '.sources_found // 0' "$RUNS_DIR/${run_id}.json")
+    fi
+    watch_state_set "$gid" "$sid" "" "$attempt_ts" "ok"
+    watch_log "OK $gid $sid run=$run_id cost=$cost"
+    printf '  ✓ %s %s: $%s, %s stages, %s sources\n' "$gid" "$sid" "$cost" "$stages" "$sources"
+    "$SCRIPT_DIR/research-status" --quiet 2>/dev/null || true
+  else
+    FAILURES=$((FAILURES + 1))
+    err=$(echo "$dr_out" | tail -1 | cut -c1-80)
+    [ -z "$err" ] && err="exit $dr_code"
+    next_run=$(now_plus_hours 2)
+    watch_state_set "$gid" "$sid" "$next_run" "$attempt_ts" "failed"
+    watch_log "FAIL $gid $sid error=$err next_run=$next_run"
+    printf '  ✗ %s %s: error (%s)\n' "$gid" "$sid" "$err"
+  fi
+done < <(echo "$PENDING" | jq -c '.[]')
+
+if [ "$FAILURES" -gt 0 ]; then
+  exit 1
+fi
+exit 0

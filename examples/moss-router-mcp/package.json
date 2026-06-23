@@ -1,0 +1,39 @@
+{
+  "name": "moss-router-mcp",
+  "version": "0.1.0",
+  "description": "MossRouter MCP Server — x402 billable MCP tools wrapping MossRouter tiers (Phase 2a MVP)",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "start:bypass": "SKIP_PAYMENT=1 MOSS_MOCK=1 node server.js",
+    "test": "bash test-moss-mcp-x402.sh",
+    "test:mock": "MOSS_MOCK=1 SKIP_PAYMENT=1 bash test-moss-mcp-x402.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "@x402/express": "^2.16.0",
+    "@x402/core": "^2.16.0",
+    "@x402/evm": "^2.16.0",
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ioredis": "^5.6.0",
+    "zod": "^3.24.0",
+    "@langfuse/tracing": "latest",
+    "@langfuse/otel": "latest",
+    "@opentelemetry/sdk-node": "latest",
+    "@opentelemetry/exporter-trace-otlp-http": "latest"
+  },
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "x402",
+    "moss-router",
+    "billable",
+    "tiers",
+    "multi-tenant",
+    "llm-router"
+  ]
+}

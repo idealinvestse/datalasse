@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# exa-contents — Stage 4 helper: get clean text from known URLs
+#
+# Input:  one or more URLs (space-separated) or @file with URLs
+# Output: clean extracted text + metadata
+#
+# When to use: you already have URLs (from /search, RSS, manual input)
+# and want clean content without running a full search.
+#
+# Usage:
+#   bin/exa-contents "https://example.com/article1" "https://example.com/article2"
+#   bin/exa-contents --file=urls.txt --highlights
+#   bin/exa-contents "https://x.com/article" --max-age=0 --text-max=20000
+#
+# Exit code: 0 on success, 1 on any error
+
+set -euo pipefail
+
+API_KEY="${EXA_API_KEY:-}"
+ENDPOINT="https://api.exa.ai/contents"
+HIGHLIGHTS="false"
+TEXT_MAX=""
+MAX_AGE=""
+URL_FILE=""
+URLS=()
+
+show_help() {
+  sed -n '2,16p' "$0"
+  echo ""
+  echo "Options:"
+  echo "  --highlights         Include query-relevant highlights (default: text only)"
+  echo "  --text-max=N         Cap text extraction to N characters"
+  echo "  --max-age=N          Cache TTL: 24/1/0/-1 (default: cache or livecrawl)"
+  echo "  --file=PATH          Read URLs from file (one URL per line)"
+  echo ""
+  echo "Setup: export EXA_API_KEY=... (or bin/load-secrets; see exa-search)"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --highlights)  HIGHLIGHTS="true" ;;
+    --text-max=*)  TEXT_MAX="${1#*=}" ;;
+    --max-age=*)   MAX_AGE="${1#*=}" ;;
+    --file=*)      URL_FILE="${1#*=}" ;;
+    --help|-h)     show_help; exit 0 ;;
+    --*)           echo "Unknown option: $1" >&2; exit 1 ;;
+    *)             URLS+=("$1") ;;
+  esac
+  shift
+done
+
+if [ ${#URLS[@]} -eq 0 ] && [ -z "$URL_FILE" ]; then
+  show_help
+  exit 1
+fi
+
+if [ -z "$API_KEY" ]; then
+  echo "Error: EXA_API_KEY not set" >&2
+  echo "" >&2
+  echo "Setup:" >&2
+  echo "  1. Sign up at https://exa.ai (free tier: 20k requests/mo + $10 credits)" >&2
+  echo "  2. Get API key from https://dashboard.exa.ai/api-keys" >&2
+  echo "  3. export EXA_API_KEY=... (or source via bin/load-secrets)" >&2
+  exit 1
+fi
+
+
+if [ -n "$URL_FILE" ]; then
+  if [ ! -f "$URL_FILE" ]; then
+    echo "Error: file not found: $URL_FILE" >&2
+    exit 1
+  fi
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    URLS+=("$line")
+  done < "$URL_FILE"
+fi
+
+if [ ${#URLS[@]} -eq 0 ]; then
+  echo "Error: no URLs provided" >&2
+  exit 1
+fi
+
+# ── build payload ─────────────────────────────────────────────────
+PAYLOAD=$(jq -n \
+  --argjson urls "$(printf '%s\n' "${URLS[@]}" | jq -R . | jq -s .)" \
+  --argjson highlights "$HIGHLIGHTS" \
+  --argjson max_age "${MAX_AGE:-null}" \
+  --argjson text_max "${TEXT_MAX:-null}" \
+  '
+  {
+    urls: $urls,
+    contents: (
+      {}
+      + (if $highlights then {highlights: true} else {} end)
+      + (if $max_age != null then {maxAgeHours: $max_age} else {} end)
+      + (if $text_max != null then {text: {maxCharacters: $text_max}} else {} end)
+    )
+  }
+  ')
+
+# ── request ───────────────────────────────────────────────────────
+RESPONSE=$(curl -s -X POST "$ENDPOINT" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d "$PAYLOAD")
+
+if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
+  echo "Exa /contents error:" >&2
+  echo "$RESPONSE" | jq -r '.error' >&2
+  exit 1
+fi
+
+# Pretty-print results
+echo "$RESPONSE" | jq .

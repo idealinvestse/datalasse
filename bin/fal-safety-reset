@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# bin/fal-safety-reset
+# Tvinga fram en safety-off audit-körning. Användbart efter manuella ändringar
+# i safety_off.py eller efter en ny fal.ai-katalog-refresh.
+#
+# Återställer state till "OK" och kör audit igen. Om gap kvarstår skickas
+# Telegram-alert omedelbart (istället för att vänta till nästa weekly cron).
+#
+# Usage:
+#   bin/fal-safety-reset          # kör audit + eventuell alert
+#   bin/fal-safety-reset --dry    # visa vad som skulle hända, ingen alert
+#   bin/fal-safety-reset --json   # maskinläsbar output
+#
+# Använd efter:
+#   - Manuell uppdatering av safety_off.py
+#   - Ny fal-models katalog-refresh
+#   - Lägga till/ändra detailed/by-model/*.md
+#   - Vid tveksamhet om aktuell state
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AUDIT="$SCRIPT_DIR/fal-safety-audit"
+
+if [[ ! -x "$AUDIT" ]]; then
+    echo "[fel] $AUDIT är inte executable" >&2
+    exit 2
+fi
+
+MODE="normal"
+for arg in "$@"; do
+    case "$arg" in
+        --dry) MODE="dry" ;;
+        --json) MODE="json" ;;
+        -h|--help)
+            sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
+            exit 0
+            ;;
+        *) echo "[fel] okänd flagga: $arg" >&2; exit 2 ;;
+    esac
+done
+
+case "$MODE" in
+    normal)
+        echo "🔄 Tvingar fram safety-off audit (state reset → OK → audit)"
+        echo
+        python3 "$AUDIT" --force-recheck
+        ;;
+    dry)
+        echo "🔍 Dry-run: safety-off audit utan alert (state reset + körning)"
+        echo
+        python3 "$AUDIT" --force-recheck --dry-run
+        ;;
+    json)
+        python3 "$AUDIT" --force-recheck --json
+        ;;
+esac

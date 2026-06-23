@@ -1,0 +1,28 @@
+{
+  "lemoncake": {
+    "port": 4021,
+    "network": "eip155:84532",
+    "payToAddress": "0x000000000000000000000000000000000000dEaD",
+    "facilitator": {
+      "url": "https://x402.org/coinbase/base-sepolia/facilitator",
+      "type": "coinbase-cdp"
+    },
+    "freeTier": {
+      "callsPerDay": 100,
+      "tracking": "in-memory-stub"
+    },
+    "tools": {
+      "search_web":           { "priceUsd": 0.001, "phase": 2 },
+      "get_weather":          { "priceUsd": 0.001, "phase": 2 },
+      "redovisning_helper":   { "priceUsd": 0.005, "phase": 1 },
+      "validate_skill_md":    { "priceUsd": 0.002, "phase": 1 },
+      "gdpr_scan":            { "priceUsd": 0.003, "phase": 1 }
+    },
+    "phase": {
+      "current": 1,
+      "description": "Testnet only. No real USDC. Bypass mode available.",
+      "mainnet": false,
+      "realUsdc": false
+    }
+  }
+}

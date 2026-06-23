@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# exa-search — CLI wrapper for Exa neural/keyword search
+# Designed for sub-agent exec() calls.
+# Usage:
+#   bin/exa-search "query text" [--type=neural|keyword] [--count=5] [--json]
+#
+# Output: Markdown by default (sub-agent friendly), JSON with --json
+
+set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# --- load API key (try systemd-compat first, then bash format) ---
+if [[ -z "${EXA_API_KEY:-}" ]]; then
+  SD_SECRETS="$HOME/.config/moss/secrets-systemd.env"
+  if [[ -f "$SD_SECRETS" ]]; then
+    set -a; source "$SD_SECRETS"; set +a
+  else
+    SECRETS="$HOME/.config/moss/secrets.env"
+    if [[ -f "$SECRETS" ]]; then
+      source "$SECRETS"
+    fi
+  fi
+fi
+
+if [[ -z "${EXA_API_KEY:-}" ]]; then
+  echo "ERROR: EXA_API_KEY not set. Check ~/.config/moss/secrets.env" >&2
+  exit 1
+fi
+
+# --- parse args ---
+QUERY=""
+TYPE="neural"
+COUNT=5
+OUTPUT_FORMAT="markdown"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type=*) TYPE="${1#*=}"; shift ;;
+    --count=*) COUNT="${1#*=}"; shift ;;
+    --json) OUTPUT_FORMAT="json"; shift ;;
+    --help|-h)
+      echo "Usage: bin/exa-search <query> [--type=neural|keyword] [--count=N] [--json]"
+      echo ""
+      echo "Searches Exa API. Default: neural search, 5 results, markdown output."
+      exit 0 ;;
+    -*)
+      echo "Unknown flag: $1"; exit 1 ;;
+    *)
+      if [[ -z "$QUERY" ]]; then QUERY="$1"; else echo "Extra arg: $1"; exit 1; fi
+      shift ;;
+  esac
+done
+
+if [[ -z "$QUERY" ]]; then
+  echo "ERROR: query required" >&2
+  echo "Usage: bin/exa-search <query> [--type=neural|keyword] [--count=N] [--json]" >&2
+  exit 1
+fi
+
+# --- call Exa API ---
+RESPONSE=$(curl -s "https://api.exa.ai/search" \
+  -H "Authorization: Bearer $EXA_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d "$(cat <<JSON
+{
+  "query": $(echo "$QUERY" | jq -Rs .),
+  "type": "$TYPE",
+  "numResults": $COUNT
+}
+JSON
+)")
+
+# --- check for errors ---
+if echo "$RESPONSE" | jq -e '.error' > /dev/null 2>&1; then
+  echo "Exa API error: $(echo "$RESPONSE" | jq -r '.error.message // .error')" >&2
+  exit 2
+fi
+
+# --- output ---
+if [[ "$OUTPUT_FORMAT" == "json" ]]; then
+  echo "$RESPONSE" | jq '.results'
+else
+  RESULTS=$(echo "$RESPONSE" | jq -c '.results[]?' 2>/dev/null)
+  COUNT=$(echo "$RESULTS" | grep -c . || true)
+  
+  if [[ "$COUNT" -eq 0 ]]; then
+    echo "**Inga resultat från Exa för:** $QUERY"
+    exit 0
+  fi
+  
+  echo "### 🔬 Exa Search ($TYPE): $(echo "$QUERY" | head -c 80)"
+  echo ""
+  
+  echo "$RESULTS" | while IFS= read -r item; do
+    TITLE=$(echo "$item" | jq -r '.title // "Untitled"')
+    URL=$(echo "$item" | jq -r '.url // "#"')
+    AUTHOR=$(echo "$item" | jq -r '.author // ""')
+    PUBLISHED=$(echo "$item" | jq -r '.published // ""')
+    SCORE=$(echo "$item" | jq -r '.score // ""')
+    
+    echo "- **[${TITLE}](${URL})**"
+    [[ -n "$AUTHOR" && "$AUTHOR" != "null" ]] && echo "  - Author: $AUTHOR"
+    [[ -n "$PUBLISHED" && "$PUBLISHED" != "null" ]] && echo "  - Published: $PUBLISHED"
+    [[ -n "$SCORE" && "$SCORE" != "null" ]] && echo "  - Score: $SCORE"
+    echo ""
+  done
+fi

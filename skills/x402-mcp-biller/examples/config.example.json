@@ -1,0 +1,21 @@
+{
+  "comment": "x402 MCP Biller example configuration (Base Sepolia testnet). See examples/lemoncake-mcp-server/ for the full priced MVP.",
+  "network": "eip155:84532",
+  "facilitator": "https://api.cdp.coinbase.com/platform/v2/x402",
+  "freeTier": {
+    "callsPerDay": 100,
+    "description": "Generous free tier for discovery"
+  },
+  "tools": [
+    {
+      "name": "example_tool",
+      "price": "$0.001",
+      "description": "Example billable tool",
+      "mimeType": "application/json"
+    }
+  ],
+  "middleware": {
+    "scheme": "exact",
+    "payTo": "0xYourTestnetAddressHere"
+  }
+}

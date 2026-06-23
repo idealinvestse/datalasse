@@ -1,0 +1,3 @@
+#!/usr/bin/env node
+// Simple wrapper so `moss-router` works after chmod + npm link or PATH
+import('./../cli.js');

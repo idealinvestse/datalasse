@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# research-metrics — weekly dashboard from metrics.jsonl + feedback.jsonl
+#
+# Usage:
+#   bin/research-metrics                    # write metrics-weekly.md
+#   bin/research-metrics --json             # stdout JSON
+#   bin/research-metrics --period=7d|30d|24h
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+JSON_OUT=0
+PERIOD="7d"
+
+parse_period_seconds() {
+  local period="$1"
+  case "$period" in
+    24h) echo $((24 * 3600)) ;;
+    7d)  echo $((7 * 86400)) ;;
+    30d) echo $((30 * 86400)) ;;
+    *)
+      echo "Error: invalid period: $period (use 24h, 7d, 30d)" >&2
+      return 1
+      ;;
+  esac
+}
+
+period_cutoff() {
+  local secs="$1"
+  date -u -d "@$(($(date +%s) - secs))" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null \
+    || date -u -r "$(($(date +%s) - secs))" +%Y-%m-%dT%H:%M:%SZ
+}
+
+cache_hit_rate_pct() {
+  local stats rate
+  stats=$("$SCRIPT_DIR/cache-research" --stats 2>/dev/null || true)
+  rate=$(echo "$stats" | grep -oE 'Hit rate: [0-9.]+%' | grep -oE '[0-9.]+' | head -1)
+  if [ -z "$rate" ]; then
+    echo "0"
+    return
+  fi
+  echo "$rate"
+}
+
+sparkline() {
+  local values="$1"
+  python3 - "$values" <<'PY'
+import sys
+vals = [float(x) for x in sys.argv[1].split(',') if x]
+if not vals:
+    print('')
+    sys.exit(0)
+chars = '▁▂▃▄▅▆▇█'
+lo, hi = min(vals), max(vals)
+if hi == lo:
+    print(chars[0] * len(vals))
+else:
+    out = []
+    for v in vals:
+        idx = int((v - lo) / (hi - lo) * (len(chars) - 1))
+        out.append(chars[idx])
+    print(''.join(out))
+PY
+}
+
+compute_snapshot() {
+  local cutoff="$1"
+  research_ensure_dirs
+
+  local metrics feedback
+  if [ -s "$METRICS_FILE" ]; then
+    metrics=$(jq -s --arg c "$cutoff" '[.[] | select(.timestamp >= $c)]' "$METRICS_FILE")
+  else
+    metrics='[]'
+  fi
+
+  if [ -s "$FEEDBACK_FILE" ]; then
+    feedback=$(jq -s --arg c "$cutoff" '[.[] | select(.ts >= $c)]' "$FEEDBACK_FILE")
+  else
+    feedback='[]'
+  fi
+
+  local total_runs total_cost success_rate avg_lat_per_stage avg_rating
+  total_runs=$(echo "$metrics" | jq 'length')
+  total_cost=$(echo "$metrics" | jq '[.[].cost // 0] | add // 0')
+  if [ "$total_runs" -gt 0 ]; then
+    success_rate=$(echo "$metrics" | jq '[.[] | select(.status == "ok")] | length / ($total | tonumber)' --argjson total "$total_runs")
+  else
+    success_rate="0"
+  fi
+  avg_lat_per_stage=$(echo "$metrics" | jq '
+    if length == 0 then 0
+    else ([.[] | (.latency_s // 0) / (if (.stages_run // 0) > 0 then .stages_run else 1 end)] | add / length)
+    end')
+  avg_rating=$(echo "$feedback" | jq 'if length > 0 then ([.[].rating] | add / length) else null end')
+
+  local top_cost top_runs cost_by_date
+  top_cost=$(echo "$metrics" | jq '[group_by(.goal_id)[] | {goal_id: .[0].goal_id, cost: ([.[].cost] | add), runs: length}] | sort_by(-.cost) | .[0:5]')
+  top_runs=$(echo "$metrics" | jq '[group_by(.goal_id)[] | {goal_id: .[0].goal_id, runs: length, cost: ([.[].cost] | add)}] | sort_by(-.runs) | .[0:5]')
+  cost_by_date=$(echo "$metrics" | jq '[group_by(.timestamp[0:10])[] | {date: .[0].timestamp[0:10], runs: length, cost: ([.[].cost] | add)}] | sort_by(.date)')
+
+  local cache_rate fallback_runs readable_runs fallback_rate rating_by_provider
+  cache_rate=$(cache_hit_rate_pct)
+
+  fallback_runs=0
+  readable_runs=0
+  if [ -d "$RUNS_DIR" ]; then
+    local f
+    for f in "$RUNS_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      local ts workdir
+      ts=$(jq -r '.timestamp // ""' "$f")
+      [[ "$ts" < "$cutoff" ]] && continue
+      workdir=$(jq -r '.workdir // ""' "$f")
+      [ -z "$workdir" ] && continue
+      [ ! -f "$workdir/cost-summary.json" ] && continue
+      readable_runs=$((readable_runs + 1))
+      local fb
+      fb=$(jq '[.events[]? | select(.event == "fallback")] | length' "$workdir/cost-summary.json" 2>/dev/null || echo 0)
+      if [ "${fb:-0}" -gt 0 ]; then
+        fallback_runs=$((fallback_runs + 1))
+      fi
+    done
+  fi
+
+  if [ "$readable_runs" -gt 0 ]; then
+    fallback_rate=$(awk -v f="$fallback_runs" -v t="$readable_runs" 'BEGIN { printf "%.4f", f / t }')
+  else
+    fallback_rate="0"
+  fi
+
+  rating_by_provider=$(echo "$feedback" | jq '
+    group_by(.provider // "unknown")
+    | map({provider: (.[0].provider // "unknown"), count: length, avg: ([.[].rating] | add / length)})
+  ')
+
+  local spark_vals spark
+  spark_vals=$(echo "$cost_by_date" | jq -r '[.[].cost] | join(",")')
+  spark=$(sparkline "$spark_vals")
+
+  jq -n \
+    --arg period "$PERIOD" \
+    --arg cutoff "$cutoff" \
+    --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    --argjson total_runs "$total_runs" \
+    --argjson total_cost "$total_cost" \
+    --argjson success_rate "$success_rate" \
+    --argjson avg_latency_per_stage "$avg_lat_per_stage" \
+    --argjson avg_rating "$avg_rating" \
+    --argjson cache_hit_rate_pct "$cache_rate" \
+    --argjson fallback_rate "$fallback_rate" \
+    --argjson fallback_runs "$fallback_runs" \
+    --argjson readable_runs "$readable_runs" \
+    --argjson top_goals_by_cost "$top_cost" \
+    --argjson top_goals_by_runs "$top_runs" \
+    --argjson cost_trend "$cost_by_date" \
+    --arg sparkline "$spark" \
+    --argjson rating_by_provider "$rating_by_provider" \
+    '{
+      period: $period,
+      cutoff: $cutoff,
+      generated_at: $generated_at,
+      total_runs: $total_runs,
+      total_cost: $total_cost,
+      success_rate: $success_rate,
+      avg_latency_per_stage: $avg_latency_per_stage,
+      avg_rating: $avg_rating,
+      cache_hit_rate_pct: ($cache_hit_rate_pct | tonumber),
+      fallback_rate: $fallback_rate,
+      fallback_runs: $fallback_runs,
+      readable_runs: $readable_runs,
+      top_goals_by_cost: $top_goals_by_cost,
+      top_goals_by_runs: $top_goals_by_runs,
+      cost_trend: $cost_trend,
+      cost_sparkline: $sparkline,
+      rating_by_provider: $rating_by_provider
+    }'
+}
+
+build_markdown() {
+  local snap="$1"
+  local end_ts period total_runs total_cost success_pct avg_rating
+
+  end_ts=$(echo "$snap" | jq -r '.generated_at' | sed 's/T/ /; s/Z/ UTC/')
+  period=$(echo "$snap" | jq -r '.period')
+  total_runs=$(echo "$snap" | jq -r '.total_runs')
+  total_cost=$(echo "$snap" | jq -r '.total_cost')
+  success_pct=$(echo "$snap" | jq -r '(.success_rate * 100 | floor)')
+  avg_rating=$(echo "$snap" | jq -r 'if .avg_rating == null then "—" else (.avg_rating | . * 10 | round / 10 | tostring) end')
+
+  {
+    echo "# Research Metrics — ${period} ending $end_ts"
+    echo ""
+    echo "## Summary"
+    printf -- '- Runs: %s | Cost: $%.2f | Success: %s%% | Avg rating: %s\n' \
+      "$total_runs" "$total_cost" "$success_pct" "$avg_rating"
+    echo "- Avg latency/stage: $(echo "$snap" | jq -r '.avg_latency_per_stage | floor')s"
+    echo "- Cache hit rate: $(echo "$snap" | jq -r '.cache_hit_rate_pct')%"
+    echo ""
+    echo "## Cost trend"
+    echo "| Date | Runs | Cost |"
+    echo "|------|------|------|"
+    echo "$snap" | jq -r '.cost_trend[]? | "| \(.date) | \(.runs) | $\(.cost | . * 100 | round / 100) |"'
+    echo ""
+    echo "Sparkline: $(echo "$snap" | jq -r '.cost_sparkline // ""')"
+    echo ""
+    echo "## Providers"
+    echo "- Runs with readable workdir: $(echo "$snap" | jq -r '.readable_runs')"
+    echo "- Serper fallback runs: $(echo "$snap" | jq -r '.fallback_runs') ($(echo "$snap" | jq -r '(.fallback_rate * 100 | floor)')%)"
+    echo ""
+    echo "## Top goals by cost"
+    echo "$snap" | jq -r '.top_goals_by_cost[]? | "- \(.goal_id): $\(.cost | . * 100 | round / 100) (\(.runs) runs)"'
+    echo ""
+    echo "## Top goals by runs"
+    echo "$snap" | jq -r '.top_goals_by_runs[]? | "- \(.goal_id): \(.runs) runs ($\(.cost | . * 100 | round / 100))"'
+    echo ""
+    echo "## Feedback by provider"
+    echo "$snap" | jq -r '.rating_by_provider[]? | "- \(.provider): \(.count) ratings, avg \(.avg | . * 10 | round / 10)"'
+  }
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)        JSON_OUT=1 ;;
+    --period=*)    PERIOD="${1#*=}" ;;
+    --help|-h)
+      sed -n '3,8p' "$0"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+secs=$(parse_period_seconds "$PERIOD")
+cutoff=$(period_cutoff "$secs")
+SNAPSHOT=$(compute_snapshot "$cutoff")
+
+if [ "$JSON_OUT" -eq 1 ]; then
+  echo "$SNAPSHOT" | jq .
+else
+  md=$(build_markdown "$SNAPSHOT")
+  atomic_write "$METRICS_WEEKLY_MD" "$md"
+  echo "$md"
+fi

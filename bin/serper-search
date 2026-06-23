@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# serper-search — wrapper for serper.dev Google SERP API
+#
+# Usage:
+#   SERPER_API_KEY="***" bin/serper-search "your query"
+#   bin/serper-search "your query" --type=news --num=10
+#   bin/serper-search "your query" --type=images
+#
+# Setup:
+#   1. Sign up at https://serper.dev (free: 2,500 queries, no CC)
+#   2. Get API key from dashboard
+#   3. export SERPER_API_KEY="***"
+#
+# Endpoints (use --type=):
+#   search (default) | images | news | maps | places | videos |
+#   shopping | scholar | patents | autocomplete
+#
+# Output: JSON to stdout (pretty-printed if --pretty)
+#
+# Reference: https://serper.dev
+
+set -euo pipefail
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+API_KEY="${SERPER_API_KEY:-}"
+ENDPOINT_BASE="https://google.serper.dev"
+TYPE="search"
+NUM_RESULTS="${NUM_RESULTS:-10}"
+PRETTY=""
+
+# Parse args
+QUERY=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --type=*)   TYPE="${1#*=}" ;;
+    --num=*)    NUM_RESULTS="${1#*=}" ;;
+    --pretty)   PRETTY="1" ;;
+    --help|-h)  sed -n '2,25p' "$0"; exit 0 ;;
+    *)          QUERY="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$QUERY" ]; then
+  echo "Error: no query provided" >&2
+  echo "Usage: bin/serper-search \"query\" [--type=news] [--num=10] [--pretty]" >&2
+  echo "Types: search, images, news, maps, places, videos, shopping, scholar, patents, autocomplete" >&2
+  exit 1
+fi
+
+if [ -z "$API_KEY" ]; then
+  echo "Error: SERPER_API_KEY not set" >&2
+  echo "" >&2
+  echo "Setup:" >&2
+  echo "  1. Sign up at https://serper.dev" >&2
+  echo "  2. Get API key from dashboard" >&2
+  echo "  3. export SERPER_API_KEY=\"***\"" >&2
+  echo "" >&2
+  echo "Free: 2,500 queries, no credit card required" >&2
+  exit 1
+fi
+
+# Build endpoint URL
+ENDPOINT="${ENDPOINT_BASE}/${TYPE}"
+
+# Make request
+RESPONSE=$(curl -s -X POST "$ENDPOINT" \
+  -H "X-API-KEY: ${API_KEY}" \
+  -H "Content-Type: application/json" \
+  -d "$(cat <<EOF
+{
+  "q": $(echo "$QUERY" | jq -Rsa .),
+  "num": $NUM_RESULTS
+}
+EOF
+)")
+
+# Check for errors
+if echo "$RESPONSE" | jq -e '.message' >/dev/null 2>&1; then
+  echo "Serper API error:" >&2
+  echo "$RESPONSE" | jq -r '.message' >&2
+  exit 2
+fi
+
+# Output
+if [ -n "$PRETTY" ]; then
+  echo "$RESPONSE" | jq .
+else
+  echo "$RESPONSE" | jq -c .
+fi

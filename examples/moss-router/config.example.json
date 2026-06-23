@@ -1,0 +1,68 @@
+{
+  "port": 4022,
+  "defaultTier": "eco",
+  "mock": false,
+  "cache": {
+    "enabled": true,
+    "threshold": 0.92,
+    "maxEntries": 2000,
+    "ttlSec": 3600
+  },
+  "cascade": {
+    "enabled": true,
+    "order": ["nano", "eco", "standard", "premium", "flagship"]
+  },
+  "failover": {
+    "maxRetriesPerProvider": 1,
+    "maxTotalAttempts": 3
+  },
+  "tiers": {
+    "nano": {
+      "description": "Ultra low cost",
+      "models": [
+        { "provider": "google", "model": "gemini-2.0-flash", "priceIn": 0.10, "priceOut": 0.40 },
+        { "provider": "groq", "model": "llama-3.1-8b-instant", "priceIn": 0.05, "priceOut": 0.08 },
+        { "provider": "openrouter", "model": "deepseek/deepseek-v4-flash", "priceIn": 0.12, "priceOut": 0.25 }
+      ]
+    },
+    "eco": {
+      "description": "Balanced daily driver (Groq wins on speed)",
+      "models": [
+        { "provider": "groq", "model": "openai/gpt-oss-20b", "priceIn": 0.075, "priceOut": 0.30 },
+        { "provider": "google", "model": "gemini-2.5-flash", "priceIn": 0.30, "priceOut": 2.50 },
+        { "provider": "openai", "model": "gpt-4.1-mini", "priceIn": 0.40, "priceOut": 1.60 }
+      ]
+    },
+    "standard": {
+      "description": "Most work",
+      "models": [
+        { "provider": "openai", "model": "gpt-4.1", "priceIn": 2.00, "priceOut": 8.00 },
+        { "provider": "anthropic", "model": "claude-sonnet-4.6", "priceIn": 3.00, "priceOut": 15.00 },
+        { "provider": "groq", "model": "llama-3.3-70b-versatile", "priceIn": 0.59, "priceOut": 0.79 }
+      ]
+    },
+    "premium": {
+      "description": "Complex reasoning (Groq gpt-oss-120b recommended for speed)",
+      "models": [
+        { "provider": "groq", "model": "openai/gpt-oss-120b", "priceIn": 0.15, "priceOut": 0.60 },
+        { "provider": "openai", "model": "gpt-4o", "priceIn": 2.50, "priceOut": 10.00 }
+      ]
+    },
+    "flagship": {
+      "description": "Max quality",
+      "models": [
+        { "provider": "openai", "model": "gpt-5.5", "priceIn": 5.00, "priceOut": 30.00 },
+        { "provider": "anthropic", "model": "claude-opus-4.8", "priceIn": 5.00, "priceOut": 25.00 },
+        { "provider": "groq", "model": "qwen/qwen3.6-27b", "priceIn": 0.60, "priceOut": 3.00 }
+      ]
+    }
+  },
+  "providers": {
+    "openai": { "apiKeyEnv": "OPENAI_API_KEY", "baseURL": null },
+    "anthropic": { "apiKeyEnv": "ANTHROPIC_API_KEY" },
+    "google": { "apiKeyEnv": "GOOGLE_API_KEY" },
+    "openrouter": { "apiKeyEnv": "OPENROUTER_API_KEY", "baseURL": "https://openrouter.ai/api/v1" },
+    "groq": { "apiKeyEnv": "GROQ_API_KEY", "baseURL": "https://api.groq.com/openai/v1" }
+  },
+  "logging": { "structured": true }
+}

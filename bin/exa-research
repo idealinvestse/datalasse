@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# exa-research — wrapper for Exa /research/v1 async deep research endpoint
+#
+# Creates autonomous research task (instructions → plan/search/crawl/synthesize).
+# Supports fire-and-forget (return task id) or blocking wait + poll.
+#
+# NOTE: /research/v1 deprecated May 2026. Prefer --type=deep-reasoning via bin/exa-search
+# for equivalent functionality going forward. This wrapper maintained per requirements.
+#
+# Usage:
+#   EXA_API_KEY="***" bin/exa-research "Summarize MCP server platforms in 2026"
+#   bin/exa-research "Compare x402 vs Stripe" --model=exa-research-pro --wait
+#   bin/exa-research "Latest AI agents" --fire-and-forget
+#   bin/exa-research "..." --output-schema=@schema.json --model=exa-research-fast
+#
+# Output: JSON (final result on --wait, or task metadata on fire-and-forget)
+# Exit: 0 success, 1 usage, 2 API error, 3 task failed
+
+set -euo pipefail
+
+export PATH="/usr/local/bin:/usr/bin:/bin:$PATH"
+
+API_KEY="${EXA_API_KEY:-}"
+ENDPOINT_CREATE="https://api.exa.ai/research/v1"
+ENDPOINT_GET="https://api.exa.ai/research/v1"
+
+MODEL="exa-research"
+INSTRUCTIONS=""
+OUTPUT_SCHEMA_FILE=""
+WAIT_MODE="1"
+FIRE_AND_FORGET=""
+PRETTY=""
+MAX_POLL=120   # ~10 minutes @ 5s
+POLL_SLEEP=5
+
+show_help() {
+  sed -n '2,14p' "$0"
+  echo ""
+  echo "Options:"
+  echo "  --model=MODEL             exa-research-fast | exa-research (default) | exa-research-pro"
+  echo "  --output-schema=@file     JSON Schema for structured output.content"
+  echo "  --wait                    Block and poll until completed (default)"
+  echo "  --fire-and-forget         Submit and immediately return {researchId, status}"
+  echo "  --pretty                  Pretty-print final JSON"
+  echo ""
+  echo "Polling stops on status=completed (billed) | failed | canceled."
+  echo "Final response includes output + citations + costDollars."
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model=*)          MODEL="${1#*=}" ;;
+    --output-schema=*)  OUTPUT_SCHEMA_FILE="${1#*=}" ;;
+    --wait)             WAIT_MODE="1"; FIRE_AND_FORGET="" ;;
+    --fire-and-forget)  FIRE_AND_FORGET="1"; WAIT_MODE="" ;;
+    --pretty)           PRETTY="1" ;;
+    --help|-h)          show_help; exit 0 ;;
+    *)                  INSTRUCTIONS="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$INSTRUCTIONS" ]; then
+  echo "Error: instructions required (first positional arg)" >&2
+  show_help >&2
+  exit 1
+fi
+
+if [ -z "$API_KEY" ]; then
+  echo "Error: EXA_API_KEY not set" >&2
+  echo "" >&2
+  echo "Setup:" >&2
+  echo "  export EXA_API_KEY=..." >&2
+  exit 1
+fi
+
+# Build optional schema
+SCHEMA_JSON="null"
+if [ -n "$OUTPUT_SCHEMA_FILE" ]; then
+  SCHEMA_PATH="${OUTPUT_SCHEMA_FILE#@}"
+  if [ ! -f "$SCHEMA_PATH" ]; then
+    echo "Error: schema file not found: $SCHEMA_PATH" >&2
+    exit 1
+  fi
+  SCHEMA_JSON=$(cat "$SCHEMA_PATH")
+fi
+
+# Create task
+PAYLOAD=$(jq -n \
+  --arg instructions "$INSTRUCTIONS" \
+  --arg model "$MODEL" \
+  --argjson output_schema "$SCHEMA_JSON" \
+  '
+  {
+    instructions: $instructions,
+    model: $model
+  }
+  + (if $output_schema != null then {outputSchema: $output_schema} else {} end)
+  ')
+
+CREATE_RESP=$(curl -s -X POST "$ENDPOINT_CREATE" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: $API_KEY" \
+  -d "$PAYLOAD")
+
+if echo "$CREATE_RESP" | jq -e '.error' >/dev/null 2>&1; then
+  echo "Exa /research create error:" >&2
+  echo "$CREATE_RESP" | jq -r '.error' >&2
+  exit 2
+fi
+
+RESEARCH_ID=$(echo "$CREATE_RESP" | jq -r '.researchId // empty')
+STATUS=$(echo "$CREATE_RESP" | jq -r '.status // empty')
+
+if [ -z "$RESEARCH_ID" ]; then
+  echo "Error: no researchId in create response" >&2
+  echo "$CREATE_RESP" | jq . >&2
+  exit 2
+fi
+
+if [ -n "$FIRE_AND_FORGET" ]; then
+  if [ -n "$PRETTY" ]; then
+    echo "$CREATE_RESP" | jq .
+  else
+    echo "$CREATE_RESP" | jq -c .
+  fi
+  exit 0
+fi
+
+# Blocking poll
+echo "Task $RESEARCH_ID created (status=$STATUS). Polling..." >&2
+
+POLL_RESP="$CREATE_RESP"
+for _ in $(seq 1 "$MAX_POLL"); do
+  STATUS=$(echo "$POLL_RESP" | jq -r '.status // "unknown"')
+  case "$STATUS" in
+    completed)
+      break
+      ;;
+    failed|canceled)
+      echo "Task $STATUS" >&2
+      if [ -n "$PRETTY" ]; then
+        echo "$POLL_RESP" | jq .
+      else
+        echo "$POLL_RESP" | jq -c .
+      fi
+      exit 3
+      ;;
+    *)
+      sleep "$POLL_SLEEP"
+      POLL_RESP=$(curl -s -X GET "$ENDPOINT_GET/$RESEARCH_ID" \
+        -H "x-api-key: $API_KEY")
+      if echo "$POLL_RESP" | jq -e '.error' >/dev/null 2>&1; then
+        echo "Exa /research poll error:" >&2
+        echo "$POLL_RESP" | jq -r '.error' >&2
+        exit 2
+      fi
+      ;;
+  esac
+done
+
+FINAL_STATUS=$(echo "$POLL_RESP" | jq -r '.status // "unknown"')
+if [ "$FINAL_STATUS" != "completed" ]; then
+  echo "Warning: poll timeout or unexpected status=$FINAL_STATUS" >&2
+fi
+
+if [ -n "$PRETTY" ]; then
+  echo "$POLL_RESP" | jq .
+else
+  echo "$POLL_RESP" | jq -c .
+fi

@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# research-graph — lightweight knowledge graph over research goals (entities)
+#
+# Usage:
+#   bin/research-graph show "EU AI Act"
+#   bin/research-graph list-entities
+#   bin/research-graph build   # (no-op for now; on-the-fly)
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh" 2>/dev/null || true
+
+CMD="${1:-show}"
+shift || true
+ENTITY="${*:-}"
+
+research_ensure_dirs
+
+extract_entities() {
+  # Very lightweight: uppercase-starting words + known tags from goal
+  python3 - "$1" <<'PY'
+import sys, re, json
+text = sys.argv[1]
+ents = re.findall(r'\b([A-Z][A-Za-z0-9\-]{2,}(?:\s+[A-Z][A-Za-z0-9\-]{1,})*)\b', text)
+ents = [e.strip() for e in ents if len(e) > 3]
+print(json.dumps(sorted(set(ents))[:8]))
+PY
+}
+
+case "$CMD" in
+  show)
+    if [ -z "$ENTITY" ]; then
+      echo "Usage: bin/research-graph show <entity>" >&2
+      exit 1
+    fi
+    echo "# Goals mentioning: $ENTITY"
+    goals=$(goals_read_json 2>/dev/null || echo '[]')
+    echo "$goals" | jq -r --arg e "$ENTITY" '
+      .[] |
+      select( (.question + (.tags|join(" ")) + (.notes|map(.text)|join(" "))) | ascii_downcase | contains($e | ascii_downcase) ) |
+      "  \(.id) [pri=\(.priority)] \(.status) — \(.question)" ' || echo "  (none)"
+    ;;
+  list-entities)
+    echo "# Top extracted entities across goals"
+    goals=$(goals_read_json 2>/dev/null || echo '[]')
+    echo "$goals" | jq -r '.[].question' | while read -r q; do
+      extract_entities "$q" | jq -r '.[]' 2>/dev/null || true
+    done | sort | uniq -c | sort -rn | head -20 | awk '{print "  "$2" ("$1")"}'
+    ;;
+  build)
+    echo "build: on-the-fly extraction. Use list-entities or show." >&2
+    ;;
+  *)
+    echo "Usage: bin/research-graph <show <entity>|list-entities|build>" >&2
+    exit 1
+    ;;
+esac

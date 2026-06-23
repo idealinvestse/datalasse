@@ -1,0 +1,40 @@
+{
+  "name": "moss-router",
+  "version": "0.1.0",
+  "description": "MossRouter — EU-sovereign multi-tier LLM router (OpenAI compatible) with semantic cache, failover, cost attribution. Phase 1 MVP.",
+  "type": "module",
+  "main": "server.js",
+  "bin": {
+    "moss-router": "./bin/moss-router"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "start:mock": "MOSS_MOCK=1 node server.js",
+    "cli": "node cli.js",
+    "test": "bash test-moss-router.sh",
+    "test:mock": "MOSS_MOCK=1 bash test-moss-router.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "openai": "^4.52.0",
+    "@anthropic-ai/sdk": "^0.27.0",
+    "@google/generative-ai": "^0.15.0"
+  },
+  "devDependencies": {},
+  "license": "MIT",
+  "keywords": [
+    "llm",
+    "router",
+    "gateway",
+    "openai-compatible",
+    "cost-optimization",
+    "semantic-cache",
+    "eu",
+    "mossfund",
+    "mcp",
+    "groq"
+  ]
+}

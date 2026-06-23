@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# research-status — live research dashboard snapshot
+#
+# Usage:
+#   bin/research-status           # write status.json + STATUS_RESEARCH.md
+#   bin/research-status --json    # stdout only
+#   bin/research-status --quiet   # refresh files, no stdout
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+MODE="write"
+JSON_ONLY=0
+QUIET=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)   JSON_ONLY=1; MODE="json" ;;
+    --quiet)  QUIET=1; MODE="quiet" ;;
+    --help|-h)
+      sed -n '3,8p' "$0"
+      exit 0
+      ;;
+    *) echo "Unknown option: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+research_ensure_dirs
+
+truncate_str() {
+  local s="$1"
+  local max="${2:-40}"
+  if [ "${#s}" -le "$max" ]; then
+    echo "$s"
+  else
+    echo "${s:0:$((max - 3))}..."
+  fi
+}
+
+relative_time() {
+  local iso="$1"
+  python3 - "$iso" <<'PY' 2>/dev/null || echo "—"
+import sys
+from datetime import datetime, timezone
+try:
+    ts = sys.argv[1].replace("T", " ").replace("-", ":")
+    # Handle run ids like 2026-06-18T22-35-12
+    raw = sys.argv[1]
+    if raw.count("-") >= 4 and "T" in raw:
+        d, t = raw.split("T", 1)
+        t = t.replace("-", ":")
+        dt = datetime.fromisoformat(f"{d}T{t}").replace(tzinfo=timezone.utc)
+    else:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    delta = datetime.now(timezone.utc) - dt
+    s = int(delta.total_seconds())
+    if s < 60: print(f"{s}s ago")
+    elif s < 3600: print(f"{s//60}m ago")
+    elif s < 86400: print(f"{s//3600}h ago")
+    else: print(f"{s//86400}d ago")
+except Exception:
+    print("—")
+PY
+}
+
+probe_api_health() {
+  local bin_path="$1"
+  local api_type="${2:-}"
+
+  if [ ! -x "$bin_path" ]; then
+    echo "unknown"
+    return
+  fi
+
+  local out rc
+  set +e
+  if [ -n "$api_type" ]; then
+    out=$(timeout 5 "$bin_path" "ping" --type="$api_type" --num=1 2>&1)
+  else
+    out=$(timeout 5 "$bin_path" "ping" --num=1 2>&1)
+  fi
+  rc=$?
+  set -e
+
+  if [ "$rc" -eq 124 ]; then
+    echo "degraded"
+    return
+  fi
+
+  if [ "$rc" -eq 0 ]; then
+    echo "ok"
+    return
+  fi
+
+  if echo "$out" | grep -qiE '401|unauthorized|auth'; then
+    echo "degraded"
+    return
+  fi
+
+  if [ "$rc" -ne 0 ]; then
+    echo "down"
+    return
+  fi
+
+  echo "unknown"
+}
+
+cache_hit_rate() {
+  local stats rate
+  stats=$("$SCRIPT_DIR/cache-research" --stats 2>/dev/null || true)
+  rate=$(echo "$stats" | grep -oE 'Hit rate: [0-9.]+%' | grep -oE '[0-9.]+' | head -1)
+  if [ -z "$rate" ]; then
+    echo "0"
+    return
+  fi
+  awk -v r="$rate" 'BEGIN { printf "%.4f", r / 100 }'
+}
+
+build_snapshot() {
+  local generated_at goals active_goals done_goals metrics_week
+  generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  goals=$(goals_read_json)
+
+  active_goals=$(echo "$goals" | jq '[.[] | select(.status == "active")] | length')
+  done_goals=$(echo "$goals" | jq '[.[] | select(.status == "done")] | length')
+
+  local week_ago
+  week_ago=$(date -u -d '7 days ago' +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || date -u -v-7d +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || echo "")
+
+  local total_cost_week=0 total_runs_week=0 avg_latency_s=0 last_run_str=""
+  if [ -s "$METRICS_FILE" ]; then
+    metrics_week=$(jq -s --arg cutoff "$week_ago" '
+      [.[] | select($cutoff == "" or .timestamp >= $cutoff)]
+    ' "$METRICS_FILE" 2>/dev/null || echo '[]')
+
+    total_runs_week=$(echo "$metrics_week" | jq 'length')
+    total_cost_week=$(echo "$metrics_week" | jq '[.[].cost // 0] | add // 0')
+    avg_latency_s=$(echo "$metrics_week" | jq 'if length > 0 then ([.[].latency_s // 0] | add / length | floor) else 0 end')
+    last_run_str=$(echo "$metrics_week" | jq -r '[.[].timestamp] | max // empty')
+  fi
+
+  local recent_runs
+  recent_runs=$(jq -s 'sort_by(.timestamp) | reverse | .[0:10]' "$METRICS_FILE" 2>/dev/null || echo '[]')
+  if [ ! -s "$METRICS_FILE" ]; then
+    recent_runs='[]'
+  fi
+
+  local exa_health serper_health hit_rate
+  if [ -n "${EXA_API_KEY:-}" ]; then
+    exa_health=$(probe_api_health "$SCRIPT_DIR/exa-search" "instant")
+  else
+    exa_health="unknown"
+  fi
+
+  if [ -n "${SERPER_API_KEY:-}" ]; then
+    serper_health=$(probe_api_health "$SCRIPT_DIR/serper-search" "")
+  else
+    serper_health="unknown"
+  fi
+
+  hit_rate=$(cache_hit_rate)
+
+  jq -n \
+    --arg generated_at "$generated_at" \
+    --argjson active_goals "$active_goals" \
+    --argjson done_goals "$done_goals" \
+    --argjson total_cost_week "$total_cost_week" \
+    --argjson total_runs_week "$total_runs_week" \
+    --argjson avg_latency_s "$avg_latency_s" \
+    --argjson cache_hit_rate "$hit_rate" \
+    --arg exa "$exa_health" \
+    --arg serper "$serper_health" \
+    --argjson goals "$goals" \
+    --argjson recent_runs "$recent_runs" \
+    --arg last_run "$last_run_str" \
+    '{
+      generated_at: $generated_at,
+      active_goals: $active_goals,
+      done_goals: $done_goals,
+      total_cost_week: $total_cost_week,
+      total_runs_week: $total_runs_week,
+      avg_latency_s: $avg_latency_s,
+      cache_hit_rate: $cache_hit_rate,
+      last_run: (if $last_run == "" then null else $last_run end),
+      health: {exa: $exa, serper: $serper},
+      goals: $goals,
+      recent_runs: $recent_runs
+    }'
+}
+
+build_markdown() {
+  local snapshot="$1"
+  local ts_human active done
+
+  ts_human=$(echo "$snapshot" | jq -r '.generated_at' | sed 's/T/ /; s/Z/ UTC/')
+  active=$(echo "$snapshot" | jq '[.goals[] | select(.status == "active")]')
+  done=$(echo "$snapshot" | jq '[.goals[] | select(.status == "done")]')
+
+  {
+    echo "# Research Status — $ts_human"
+    echo ""
+    echo "## 🟢 Active goals ($(echo "$active" | jq 'length'))"
+    echo "| ID | Question | Priority | Last run | Cost | Status |"
+    echo "|----|----------|----------|----------|------|--------|"
+
+    echo "$active" | jq -c '.[]' | while read -r g; do
+      local id q pri cost steps last_run_id rel
+      id=$(echo "$g" | jq -r '.id')
+      q=$(truncate_str "$(echo "$g" | jq -r '.question')" 40)
+      pri=$(echo "$g" | jq -r '.priority')
+      cost=$(echo "$g" | jq -r '.cost_so_far')
+      steps=$(echo "$g" | jq -r 'if .total_steps > 0 then "\(.answered_steps)/\(.total_steps) steps" else "—" end')
+      last_run_id=$(echo "$g" | jq -r '.runs[-1] // empty')
+      if [ -n "$last_run_id" ]; then
+        rel=$(relative_time "$last_run_id")
+      else
+        rel="—"
+      fi
+      printf '| %s | %s | %s | %s | $%.2f | %s |\n' "$id" "$q" "$pri" "$rel" "$cost" "$steps"
+    done
+
+    echo ""
+    echo "## ✅ Done goals ($(echo "$done" | jq 'length'))"
+    echo "| ID | Question | Completed | Cost |"
+    echo "|----|----------|-----------|------|"
+
+    echo "$done" | jq -c '.[]' | while read -r g; do
+      local id q completed cost
+      id=$(echo "$g" | jq -r '.id')
+      q=$(truncate_str "$(echo "$g" | jq -r '.question')" 40)
+      completed=$(echo "$g" | jq -r '.updated_at' | cut -dT -f1)
+      cost=$(echo "$g" | jq -r '.cost_so_far')
+      printf '| %s | %s | %s | $%.2f |\n' "$id" "$q" "$completed" "$cost"
+    done
+
+    echo ""
+    echo "## 📊 Last 7 days"
+    echo "- Runs: $(echo "$snapshot" | jq -r '.total_runs_week')"
+    printf -- "- Total cost: $%.2f\n" "$(echo "$snapshot" | jq -r '.total_cost_week')"
+    echo "- Avg latency: $(echo "$snapshot" | jq -r '.avg_latency_s')s"
+    echo "- Cache hit rate: $(awk -v r="$(echo "$snapshot" | jq -r '.cache_hit_rate')" 'BEGIN { printf "%.0f%%", r * 100 }')"
+
+    echo ""
+    echo "## 🏥 API health"
+    local exa serper
+    exa=$(echo "$snapshot" | jq -r '.health.exa')
+    serper=$(echo "$snapshot" | jq -r '.health.serper')
+    case "$exa" in
+      ok) echo "- Exa: ✅ ok" ;;
+      degraded) echo "- Exa: ⚠️ degraded" ;;
+      *) echo "- Exa: ❓ $exa" ;;
+    esac
+    case "$serper" in
+      ok) echo "- Serper: ✅ ok" ;;
+      degraded) echo "- Serper: ⚠️ degraded" ;;
+      *) echo "- Serper: ❓ $serper" ;;
+    esac
+
+    echo ""
+    echo "## 🔥 Recent runs"
+    echo "$snapshot" | jq -r '.recent_runs[]? | "- \(.timestamp // "—") — \(.goal_id // "—") \"\(.question // "" | .[0:30])\" — $\(.cost // 0) — \(.stages_run // 0) stages"' | head -10
+  }
+}
+
+SNAPSHOT=$(build_snapshot)
+
+case "$MODE" in
+  json)
+    echo "$SNAPSHOT" | jq .
+    ;;
+  quiet)
+    atomic_write "$STATUS_JSON" "$(echo "$SNAPSHOT" | jq .)"
+    atomic_write "$STATUS_MD" "$(build_markdown "$SNAPSHOT")"
+    ;;
+  write)
+    atomic_write "$STATUS_JSON" "$(echo "$SNAPSHOT" | jq .)"
+    TMP_MD="${STATUS_MD}.tmp.$$"
+    build_markdown "$SNAPSHOT" > "$TMP_MD"
+    mv "$TMP_MD" "$STATUS_MD"
+    if [ "$QUIET" -eq 0 ]; then
+      cat "$STATUS_MD"
+    fi
+    ;;
+esac

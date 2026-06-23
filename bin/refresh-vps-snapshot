@@ -1,0 +1,107 @@
+#!/usr/bin/env bash
+# bin/refresh-vps-snapshot
+# Refresh STATUS.md + STATUS.json from bin/vps-status. Designed for cron
+# (5-min interval). Pure bash, minimal deps, fail-quiet.
+#
+# Usage: bin/refresh-vps-snapshot
+# Crontab: */5 * * * * /root/.openclaw/workspace/bin/refresh-vps-snapshot
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORKSPACE_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+VPS_BIN="$SCRIPT_DIR/vps-status"
+MD="$WORKSPACE_DIR/STATUS.md"
+JSON="$WORKSPACE_DIR/STATUS.json"
+TMP_MD="$MD.tmp.$$"
+TMP_JSON="$JSON.tmp.$$"
+TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Pre-flight
+if [[ ! -x "$VPS_BIN" ]]; then
+  echo "[$TS] refresh-snapshot: vps-status not executable at $VPS_BIN" >&2
+  exit 1
+fi
+
+# 1. JSON snapshot (full structure)
+if ! "$VPS_BIN" --json > "$TMP_JSON" 2>/dev/null; then
+  echo "[$TS] refresh-snapshot: vps-status --json failed" >&2
+  rm -f "$TMP_JSON"
+  exit 1
+fi
+# Validate JSON (requires python3 on host; fall back silently)
+if command -v python3 >/dev/null 2>&1; then
+  if ! python3 -c "import json,sys; json.load(open(sys.argv[1]))" "$TMP_JSON" 2>/dev/null; then
+    echo "[$TS] refresh-snapshot: invalid JSON produced" >&2
+    rm -f "$TMP_JSON"
+    exit 1
+  fi
+fi
+mv "$TMP_JSON" "$JSON"
+
+# 2. Text snapshot (no color, header + all sections)
+TEXT=$("$VPS_BIN" --no-color 2>/dev/null || echo "(vps-status failed)")
+
+# 3. Quick alert summary (parsed inline; no jq dep)
+ALERT_LINE=$(python3 - <<PYEOF 2>/dev/null || echo "(alert parse skipped)"
+import json
+d = json.load(open("$JSON"))
+cpu = d.get("cpu", {}).get("total_pct", 0)
+mem = d.get("memory", {})
+avail = mem.get("avail_kb", 1)
+total = mem.get("total_kb", 1)
+used_pct = 100 * (1 - avail/total) if total else 0
+disk = d.get("disk", [])
+disk_pct = max((m.get("pct", 0) for m in disk), default=0)
+load = d.get("cpu", {}).get("load", {}).get("1", 0)
+nproc = d.get("cpu", {}).get("load", {}).get("nproc", 1)
+svc_fail = d.get("services", {}).get("failed", 0)
+issues = []
+if cpu >= 90:        issues.append(f"CPU {cpu:.0f}%")
+if used_pct >= 95:   issues.append(f"MEM {used_pct:.0f}%")
+if disk_pct >= 95:   issues.append(f"DISK {disk_pct}%")
+if load > 2 * nproc: issues.append(f"LOAD {load:.1f}>2x nproc")
+if svc_fail > 0:     issues.append(f"{svc_fail} failed svc")
+print("ALERT: " + ", ".join(issues) if issues else "OK")
+PYEOF
+)
+
+# 4. Compose MD
+{
+  echo "# VPS Status Snapshot"
+  echo
+  echo "> Auto-refreshed every 5 minutes by cron → \`bin/refresh-vps-snapshot\`"
+  echo "> Last refresh: $TS"
+  echo "> Health: $ALERT_LINE"
+  echo
+  echo '```'
+  echo "$TEXT"
+  echo '```'
+  echo
+  echo "## Reading"
+  echo
+  echo "- Full machine-readable: \`STATUS.json\`"
+  echo "- Regenerate manually: \`./bin/refresh-vps-snapshot\`"
+  echo "- Quick check: \`./bin/vps-status --section=cpu --no-color\`"
+} > "$TMP_MD"
+mv "$TMP_MD" "$MD"
+
+# 5. Touch a small state file (heartbeat can detect staleness)
+date -u +%Y-%m-%dT%H:%M:%SZ > "$WORKSPACE_DIR/.vps-snapshot-stamp"
+
+# 6. Optional: openclaw notify on alert state-change
+ALERT_STATE="$WORKSPACE_DIR/.vps-alert-state"
+PREV="OK"
+[[ -f "$ALERT_STATE" ]] && PREV=$(cat "$ALERT_STATE" 2>/dev/null || echo "OK")
+echo "${ALERT_LINE#ALERT: }" > "$ALERT_STATE"
+if [[ "$ALERT_LINE" == ALERT:* && "$PREV" == "OK" ]]; then
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw message send --channel telegram --target 438805461 \
+      --message "⚠️ VPS alert: ${ALERT_LINE#ALERT: }" >/dev/null 2>&1 || true
+  fi
+  echo "[$TS] ALERT raised: $ALERT_LINE" >> "$WORKSPACE_DIR/.vps-alert-log"
+elif [[ "$ALERT_LINE" == "OK" && "$PREV" != "OK" ]]; then
+  echo "[$TS] ALERT cleared (was: $PREV)" >> "$WORKSPACE_DIR/.vps-alert-log"
+fi
+
+exit 0

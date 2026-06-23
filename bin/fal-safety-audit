@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""bin/fal-safety-audit
+
+Weekly audit som upptäcker fal.ai-modeller med user-facing safety-parametrar
+(`enable_safety_checker`, `safety_tolerance`) som INTE täcks av
+`skills/fal-ai/safety_off.py::SAFETY_OFF_DEFAULTS`.
+
+Skickar Telegram-alert (via `openclaw message send`) om ett nytt gap upptäcks.
+State-detektion: bara alert när state ändras från OK till ALERT, inte varje körning.
+
+Usage:
+    bin/fal-safety-audit              # full audit + eventuell alert
+    bin/fal-safety-audit --json       # maskinläsbar output
+    bin/fal-safety-audit --dry-run    # ingen alert skickas
+
+Crontab:
+    15 9 * * 1 /root/.openclaw/workspace/bin/fal-safety-audit
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+WORKSPACE = Path("/root/.openclaw/workspace")
+SAFETY_OFF_PY = WORKSPACE / "skills" / "fal-ai" / "safety_off.py"
+DETAILED_DIR = WORKSPACE / "research" / "fal-models" / "detailed" / "by-model"
+ENRICHMENT_JSON = WORKSPACE / "research" / "fal-models" / "detailed" / "enrichment-results.json"
+STATE_FILE = WORKSPACE / ".fal-safety-audit-state"
+LOG_FILE = WORKSPACE / ".fal-safety-audit.log"
+TELEGRAM_TARGET = "438805461"
+
+SAFETY_PARAM_PATTERNS = {
+    "enable_safety_checker": re.compile(r"`enable_safety_checker`"),
+    "safety_tolerance": re.compile(r"`safety_tolerance`"),
+}
+
+
+def load_configured_models() -> set[str]:
+    """Läs SAFETY_OFF_DEFAULTS från safety_off.py utan att exekvera modulen
+    (fal_client är inte installerat i cron-context).
+    Använder balanserad brace-matchning för att hitta HELA dict-literalen
+    (inre {} på värden gör non-greedy regex otillräcklig)."""
+    text = SAFETY_OFF_PY.read_text()
+    # Hitta start på dict-literalen
+    start_marker = "SAFETY_OFF_DEFAULTS"
+    start = text.find(start_marker)
+    if start < 0:
+        raise RuntimeError("Kunde inte hitta SAFETY_OFF_DEFAULTS")
+    # Hitta första { efter =
+    eq = text.find("=", start)
+    brace_open = text.find("{", eq)
+    if brace_open < 0:
+        raise RuntimeError("Kunde inte hitta '{' efter SAFETY_OFF_DEFAULTS")
+    # Balanserad brace-matchning
+    depth = 0
+    body_start = brace_open + 1
+    for i in range(brace_open, len(text)):
+        c = text[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                body = text[body_start:i]
+                break
+    else:
+        raise RuntimeError("Kunde inte hitta matchande '}' för SAFETY_OFF_DEFAULTS")
+    # Extrahera bara model-ID-nycklar (på top-level, före kolon, innehåller /)
+    return set(re.findall(r'"([\w][\w.\-]*/[\w.\-/]+)":', body))
+
+
+def parse_filename_to_endpoint(filename: str) -> str:
+    """`fal-ai_flux-pro_v1.1-ultra.md` → `fal-ai/flux-pro/v1.1-ultra`"""
+    return filename.removesuffix(".md").replace("_", "/")
+
+
+def audit_enrichment_results(configured: set[str]) -> list[dict]:
+    """Primär källa: enrichment-results.json (redan parsad)."""
+    if not ENRICHMENT_JSON.exists():
+        return []
+    data = json.loads(ENRICHMENT_JSON.read_text())
+    results = data.get("results", {})
+    gaps = []
+    for endpoint_id, info in results.items():
+        input_fields = info.get("input_fields", [])
+        safety_fields = [
+            f["name"] for f in input_fields
+            if f.get("name") in SAFETY_PARAM_PATTERNS
+        ]
+        if safety_fields and endpoint_id not in configured:
+            gaps.append({
+                "endpoint_id": endpoint_id,
+                "safety_fields": safety_fields,
+                "source": "enrichment-results.json",
+            })
+    return gaps
+
+
+def audit_markdown_files(configured: set[str]) -> list[dict]:
+    """Sekundär källa: detailed/by-model/*.md (backup ifall enrichment-json är stale).
+    Filtrerar bort icke-modell-filer (t.ex. *-prompt-guide.md) genom att kräva
+    match mot känd endpoint från enrichment-results.json eller katalog."""
+    if not DETAILED_DIR.exists():
+        return []
+    # Hämta kända endpoints från enrichment-json (whitelist)
+    known_endpoints: set[str] = set()
+    if ENRICHMENT_JSON.exists():
+        data = json.loads(ENRICHMENT_JSON.read_text())
+        known_endpoints = set(data.get("results", {}).keys())
+    gaps = []
+    for fp in DETAILED_DIR.glob("*.md"):
+        # Hoppa över filer som inte matchar känd endpoint
+        endpoint_id = parse_filename_to_endpoint(fp.name)
+        if endpoint_id not in known_endpoints:
+            continue
+        text = fp.read_text()
+        safety_fields = [
+            name for name, pat in SAFETY_PARAM_PATTERNS.items()
+            if pat.search(text)
+        ]
+        if safety_fields and endpoint_id not in configured:
+            gaps.append({
+                "endpoint_id": endpoint_id,
+                "safety_fields": safety_fields,
+                "source": str(fp.relative_to(WORKSPACE)),
+            })
+    return gaps
+
+
+def deduplicate(gaps: list[dict]) -> list[dict]:
+    """Samma endpoint kan dyka i båda källorna — deduplicera per endpoint_id."""
+    seen: dict[str, dict] = {}
+    for g in gaps:
+        eid = g["endpoint_id"]
+        if eid not in seen:
+            seen[eid] = g
+        else:
+            # Slå ihop safety_fields
+            for f in g["safety_fields"]:
+                if f not in seen[eid]["safety_fields"]:
+                    seen[eid]["safety_fields"].append(f)
+            seen[eid]["source"] += f" + {g['source']}"
+    return sorted(seen.values(), key=lambda x: x["endpoint_id"])
+
+
+def send_telegram(message: str) -> bool:
+    """Skicka via openclaw message send. Returnerar True vid success."""
+    try:
+        result = subprocess.run(
+            [
+                "openclaw", "message", "send",
+                "--channel", "telegram",
+                "--target", TELEGRAM_TARGET,
+                "--message", message,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
+        print(f"[send_telegram] error: {e}", file=sys.stderr)
+        return False
+
+
+def get_previous_state() -> str:
+    """Returnerar senaste state ('OK' eller 'ALERT')."""
+    if STATE_FILE.exists():
+        return STATE_FILE.read_text().strip() or "OK"
+    return "OK"
+
+
+def write_state(state: str) -> None:
+    STATE_FILE.write_text(state + "\n")
+
+
+def log(line: str) -> None:
+    msg = f"[{datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')}] {line}\n"
+    LOG_FILE.open("a").write(msg)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser.add_argument("--json", action="store_true", help="Maskinläsbar output")
+    parser.add_argument("--dry-run", action="store_true", help="Skippa Telegram-alert")
+    parser.add_argument("--force-recheck", action="store_true",
+                        help="Återställ state till OK innan körning — tvingar fram alert om gap kvarstår")
+    args = parser.parse_args()
+
+    if args.force_recheck:
+        write_state("OK")
+        log("state_reset=forced")
+
+    if not SAFETY_OFF_PY.exists():
+        print(f"FEL: {SAFETY_OFF_PY} finns inte", file=sys.stderr)
+        sys.exit(2)
+
+    try:
+        configured = load_configured_models()
+    except Exception as e:
+        print(f"FEL: kunde inte ladda SAFETY_OFF_DEFAULTS: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    gaps = deduplicate(audit_enrichment_results(configured) + audit_markdown_files(configured))
+    prev_state = get_previous_state()
+    if args.force_recheck:
+        prev_state = "OK"  # tvinga state-change-detektion
+    new_state = "ALERT" if gaps else "OK"
+
+    summary = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "configured_models": len(configured),
+        "gaps_found": len(gaps),
+        "state_change": prev_state != new_state,
+        "previous_state": prev_state,
+        "current_state": new_state,
+        "gaps": gaps,
+    }
+
+    if args.json:
+        print(json.dumps(summary, indent=2))
+    else:
+        print(f"Configured: {len(configured)} modeller")
+        print(f"Gaps: {len(gaps)}")
+        if gaps:
+            print("\nModeller med safety-params som INTE är i SAFETY_OFF_DEFAULTS:")
+            for g in gaps:
+                fields = ", ".join(g["safety_fields"])
+                print(f"  • {g['endpoint_id']} ({fields}) — källa: {g['source']}")
+        print(f"State: {prev_state} → {new_state}")
+
+    # Log alltid
+    log(f"state={new_state} gaps={len(gaps)} configured={len(configured)}")
+
+    # Alert endast på state-change OK → ALERT (inte på återkommande ALERT)
+    if new_state == "ALERT" and prev_state == "OK" and not args.dry_run:
+        msg_lines = [
+            "⚠️ **fal.ai safety-off audit — nya gap upptäckta**",
+            "",
+            f"Hittade {len(gaps)} modell(er) med user-facing safety-parametrar",
+            "som INTE finns i `skills/fal-ai/safety_off.py::SAFETY_OFF_DEFAULTS`.",
+            "",
+        ]
+        for g in gaps[:10]:  # cap till 10 i meddelandet
+            fields = ", ".join(g["safety_fields"])
+            msg_lines.append(f"• `{g['endpoint_id']}` — {fields}")
+        if len(gaps) > 10:
+            msg_lines.append(f"... och {len(gaps) - 10} till")
+        msg_lines += [
+            "",
+            "**Åtgärd:** lägg till i SAFETY_OFF_DEFAULTS eller explicit markera",
+            "som 'provider-only' i NO_USER_SAFETY_MODELS.",
+            "",
+            f"Kör: `bin/fal-safety-audit` för detaljer",
+            f"Log: `{LOG_FILE.relative_to(WORKSPACE)}`",
+        ]
+        ok = send_telegram("\n".join(msg_lines))
+        log(f"alert_sent={'ok' if ok else 'failed'}")
+        if not ok and not args.json:
+            print("\n[FEL] Telegram-alert kunde inte skickas", file=sys.stderr)
+
+    # Always update state
+    write_state(new_state)
+    sys.exit(0 if new_state == "OK" else 1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+{
+  "skills": {
+    "entries": {
+      "uncensored-fallback": {
+        "enabled": true,
+        "apiKey": "sk-or-v1-DIN_OPENROUTER_API_NYCKEL_HÄR",
+        "comment": "Ersätt med din riktiga OpenRouter-nyckel. Hämtas automatiskt av OpenClaw vid anrop till uncensored-fallback-skillen."
+      }
+    }
+  }
+}

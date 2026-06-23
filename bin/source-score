@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# source-score — domain-based credibility scorer for research sources (1-5)
+#
+# Usage:
+#   bin/source-score "https://eur-lex.europa.eu/..."
+#   bin/source-score "https://twitter.com/..."
+#
+# Output: JSON {url, credibility: 1-5, reasoning: "..." }
+#
+# Pure static scoring. No network, no API keys.
+
+set -euo pipefail
+
+URL="${1:-}"
+if [ -z "$URL" ]; then
+  echo "Usage: bin/source-score URL" >&2
+  echo "Example: bin/source-score https://eur-lex.europa.eu/..." >&2
+  exit 1
+fi
+
+# Extract domain + path (lowercase)
+DOMAIN=$(echo "$URL" | sed -E 's|https?://([^/]+).*|\1|' | tr '[:upper:]' '[:lower:]')
+PATH_PART=$(echo "$URL" | sed -E 's|https?://[^/]+(.*)|\1|' | tr '[:upper:]' '[:lower:]')
+
+CRED=2
+REASONING="Default medium credibility (general web source)"
+
+score_domain() {
+  case "$DOMAIN" in
+    *.gov|*.edu|*.eu)
+      CRED=5
+      REASONING="High-authority government/education/EU domain"
+      ;;
+    eur-lex.europa.eu|ec.europa.eu|*.who.int|whitehouse.gov|sec.gov)
+      CRED=5
+      REASONING="Official regulatory/government source"
+      ;;
+    reuters.com|bloomberg.com|forbes.com|wsj.com|ft.com)
+      CRED=4
+      REASONING="Major reputable business/financial news"
+      ;;
+    nature.com|science.org|arxiv.org|*.nature.com)
+      CRED=4
+      REASONING="Peer-reviewed/academic source"
+      ;;
+    nytimes.com|bbc.com|bbc.co.uk|techcrunch.com)
+      CRED=3
+      REASONING="Established mainstream media"
+      ;;
+    wikipedia.org)
+      CRED=3
+      REASONING="Wikipedia (useful overview, verify primaries)"
+      ;;
+    medium.com|*.medium.com|substack.com|linkedin.com)
+      CRED=2
+      REASONING="User-generated or newsletter (variable quality)"
+      ;;
+    x.com|twitter.com|reddit.com|tiktok.com|youtube.com)
+      CRED=1
+      REASONING="Social/user-generated platform (lowest base credibility)"
+      ;;
+  esac
+}
+
+score_path() {
+  if echo "$PATH_PART" | grep -qE '(eu|directive|regulation|act|legislation|official|report|eurlex)'; then
+    if [ "$CRED" -lt 5 ]; then
+      CRED=5
+      REASONING="Regulatory/official document path (elevated)"
+    fi
+  fi
+}
+
+score_domain
+score_path
+
+# Clamp
+if [ "$CRED" -gt 5 ]; then CRED=5; fi
+if [ "$CRED" -lt 1 ]; then CRED=1; fi
+
+jq -n \
+  --arg url "$URL" \
+  --argjson cred "$CRED" \
+  --arg reason "$REASONING" \
+  '{url: $url, credibility: $cred, reasoning: $reason}'
