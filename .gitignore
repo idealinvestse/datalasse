@@ -112,3 +112,4 @@ Thumbs.db
 # ---------- Allow README / examples docs explicitly ----------
 # (these are matched by docs/, examples/, skills/ but the patterns
 # above could otherwise be too greedy — leave the rest to git)
+.backups/

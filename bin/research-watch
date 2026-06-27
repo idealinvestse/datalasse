@@ -13,6 +13,18 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=lib/research-state.sh
 source "$SCRIPT_DIR/lib/research-state.sh"
 
+# Source secrets if API keys aren't already in env (cron has minimal env)
+# This ensures EXA_API_KEY / SERPER_API_KEY are available for downstream calls.
+if [ -z "${EXA_API_KEY:-}" ] || [ -z "${SERPER_API_KEY:-}" ]; then
+  SECRETS_FILE="${HOME}/.config/moss/secrets.env"
+  if [ -f "$SECRETS_FILE" ]; then
+    # shellcheck disable=SC1090
+    set -a; source "$SECRETS_FILE"; set +a
+  else
+    echo "Warning: ${SECRETS_FILE} not found; EXA/SERPER calls may fail" >&2
+  fi
+fi
+
 DEEP_RESEARCH_BIN="${DEEP_RESEARCH_BIN:-$SCRIPT_DIR/deep-research}"
 
 ALL_MODE=1

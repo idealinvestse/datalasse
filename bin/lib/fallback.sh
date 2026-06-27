@@ -63,7 +63,7 @@ search_with_fallback() {
 
   exa_out=$(mktemp)
   set +e
-  retry_with_backoff 3 1 "$exa_cmd" "$query" --type="$type" --num="$num" >"$exa_out" 2>&1
+  retry_with_backoff 3 1 "$exa_cmd" "$query" --type="$type" --count="$num" >"$exa_out" 2>&1
   exa_code=$?
   set -e
 

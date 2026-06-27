@@ -409,10 +409,24 @@ else
 fi
 
 # ── STAGE 4: Full content extraction (P0-2) ────────────────────────
+# Source secrets if needed (defensive — research-watch already sources, but
+# deep-research can be invoked directly too).
+if [ -z "${EXA_API_KEY:-}" ]; then
+  SECRETS_FILE="${HOME}/.config/moss/secrets.env"
+  if [ -f "$SECRETS_FILE" ]; then
+    # shellcheck disable=SC1090
+    set -a; source "$SECRETS_FILE"; set +a
+  fi
+fi
+
 echo "" >&2
 echo "═══ Stage 4: Full content extraction ═══" >&2
+if [ -z "${EXA_API_KEY:-}" ]; then
+  echo "  ⚠️ EXA_API_KEY unset — Stage 4 will skip content extraction (highlights only)" >&2
+fi
 EXA_CONTENTS_BIN="${EXA_CONTENTS_BIN:-$SCRIPT_DIR/exa-contents}"
 CONTENT_ADDED=0
+STAGE4_SKIPPED=0
 i=0
 while [ $i -lt $NUM_ACTUAL ]; do
   if cost_exceeded; then
@@ -420,22 +434,33 @@ while [ $i -lt $NUM_ACTUAL ]; do
     break
   fi
   urls=""
-  for jf in "$WORKDIR/exa-$i.json" "$WORKDIR/stage3-$i.json" "$WORKDIR/stage3-0.json" ; do
+  # Stage 2 puts results in exa-$i.json / serper-$i.json; Stage 3 in stage3-$i.json
+  for jf in "$WORKDIR/exa-$i.json" "$WORKDIR/serper-$i.json" "$WORKDIR/stage3-$i.json"; do
     if [ -f "$jf" ]; then
       more=$(jq -r '(.results // .organic // [])[0:3][] | .url // .link // empty' "$jf" 2>/dev/null | sort -u | head -3 || true)
       urls=$(printf "%s\n%s" "$urls" "$more" | sort -u | grep . | head -3)
     fi
   done
-  if [ -n "$urls" ] && [ -n "${EXA_API_KEY:-}" ]; then
+  if [ -z "$urls" ]; then
+    echo "  ⚠️ Stage 4 subq $((i+1)): no URLs found in stage2/3 outputs — skipping" >&2
+    STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
+  elif [ -z "${EXA_API_KEY:-}" ]; then
+    echo "  ⚠️ Stage 4 subq $((i+1)): EXA_API_KEY missing — skipping content extraction" >&2
+    STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
+  else
     echo "  📄 Extracting full content for subq $((i+1)) (top URLs)" >&2
-    # call exa-contents with up to 3 urls
+    # call exa-contents with up to 3 urls, with retry
     set +e
-    "$EXA_CONTENTS_BIN" $urls --text-max=10000 > "$WORKDIR/content-$i.json" 2>"$WORKDIR/content-$i.log" || true
+    retry_with_backoff 2 2 "$EXA_CONTENTS_BIN" $urls --text-max=10000 > "$WORKDIR/content-$i.json" 2>"$WORKDIR/content-$i.log"
+    exa_rc=$?
     set -e
-    if [ -s "$WORKDIR/content-$i.json" ]; then
+    if [ "$exa_rc" -eq 0 ] && [ -s "$WORKDIR/content-$i.json" ]; then
       c=$(extract_cost "$WORKDIR/content-$i.json" 2>/dev/null || echo 0.03)
       add_cost "$c" "stage4-exa-$i"
       CONTENT_ADDED=$((CONTENT_ADDED + 1))
+    else
+      echo "  ⚠️ Stage 4 subq $((i+1)): exa-contents failed (rc=$exa_rc); see content-$i.log" >&2
+      STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
     fi
   fi
   i=$((i+1))
@@ -443,6 +468,8 @@ done
 if [ "$CONTENT_ADDED" -gt 0 ]; then
   STAGES_RUN=$((STAGES_RUN + 1))
   echo "✅ Stage 4 content extracted for $CONTENT_ADDED sub-queries (accum cost: $TOTAL_COST)" >&2
+elif [ "$STAGE4_SKIPPED" -gt 0 ]; then
+  echo "ℹ️ Stage 4: skipped $STAGE4_SKIPPED sub-queries (no content extraction)" >&2
 fi
 maybe_pause "after Stage 4"
 
