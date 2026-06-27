@@ -176,18 +176,15 @@ cmd_plan() {
     PLAN_MODEL="${PLAN_MODEL#openrouter/}"
     SYS="You are a research planner. Break the goal into 3-7 concrete actionable research steps. Each step is a focused sub-question or task usable by deep-research. Return ONLY JSON array of objects: {step_id: 'step-N', question: string, rationale: string}."
     USR="Goal question: $question. Generate 3-7 steps."
-    PAY=$(jq -n --arg m "$PLAN_MODEL" --arg s "$SYS" --arg u "$USR" '{
-      model: $m, messages: [{role:"system",content:$s},{role:"user",content:$u}],
-      temperature:0.3, max_tokens:1200
-    }')
     RESP=""
     for att in 1 2; do
-      RESP=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
-        -H "Authorization: Bearer $OR_KEY" -H "Content-Type: application/json" -d "$PAY" 2>/dev/null || echo "")
+      RESP=$(bin/llm-call --group=subagent-research-quick \
+        --prompt="$USR" --system="$SYS" \
+        --model="$PLAN_MODEL" --temperature=0.3 --max-tokens=1200 --json 2>/dev/null || echo "")
       [ -n "$RESP" ] && break
       sleep 1
     done
-    CONTENT=$(echo "$RESP" | jq -r '.choices[0].message.content // ""' | perl -0777 -ne 'if (m/\[.*\]/s) { print $& }' || echo "")
+    CONTENT=$(echo "$RESP" | jq -r '.content // ""' | perl -0777 -ne 'if (m/\[.*\]/s) { print $& }' || echo "")
     if echo "$CONTENT" | jq -e 'type=="array"' >/dev/null 2>&1; then
       STEPS=$(echo "$CONTENT" | jq -c '.')
       N=$(echo "$STEPS" | jq 'length')

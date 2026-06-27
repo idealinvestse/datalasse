@@ -20,10 +20,12 @@ from lib.llm_router.telemetry import daily_rollup  # type: ignore
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="Internal LLM Router CLI (Phase 1)")
-    p.add_argument("--group", required=True, help="task group name e.g. cron-status-check")
-    p.add_argument("--prompt", required=True, help="user prompt text")
+    p.add_argument("--group", required=False, help="task group name e.g. cron-status-check")
+    p.add_argument("--prompt", required=False, help="user prompt text")
     p.add_argument("--system", default=None, help="optional system prompt")
     p.add_argument("--max-tokens", type=int, default=None)
+    p.add_argument("--temperature", type=float, default=None, help="sampling temperature (default 0.2)")
+    p.add_argument("--model", default=None, help="optional explicit model override (uses group policy for caps/telemetry)")
     p.add_argument("--dry-run", action="store_true", help="show selection + est cost, no call")
     p.add_argument("--json", action="store_true", help="output json")
     p.add_argument("--config", default=None, help="path to config json")
@@ -37,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cfg = load_config(args.config)
     groups = list(cfg.get("groups", {}).keys())
-    if args.group not in groups:
+    if args.group and args.group not in groups:
         print(f"ERROR: unknown group '{args.group}'. Known: {groups}", file=sys.stderr)
         return 2
 
@@ -74,6 +76,8 @@ def main(argv: list[str] | None = None) -> int:
             system=args.system,
             max_tokens=args.max_tokens,
             config_path=args.config,
+            temperature=args.temperature,
+            model_override=args.model,
         )
         meta["content_preview"] = (content or "")[:200]
         if args.json:

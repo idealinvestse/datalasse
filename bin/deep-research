@@ -142,14 +142,10 @@ fi
 ORIGINAL_QUERY="$QUERY"
 if [ "$LANGUAGE" = "sv" ] && [ -n "${OPENROUTER_API_KEY:-}" ]; then
   echo "🌐 Translating query to Swedish..." >&2
-  TRANS_PAYLOAD=$(jq -n --arg model "$SYNTH_MODEL" --arg q "$QUERY" '{
-    model: $model,
-    messages: [{role:"user", content: ("Translate this research question to Swedish, keep proper names/URLs/technical terms: " + $q)}],
-    temperature: 0.2, max_tokens: 200
-  }')
-  TRANS_RESP=$(retry_with_backoff 2 1 curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
-    -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H "Content-Type: application/json" -d "$TRANS_PAYLOAD" 2>/dev/null || echo "")
-  SVQ=$(echo "$TRANS_RESP" | jq -r '.choices[0].message.content // empty' 2>/dev/null | head -c 500 | tr -d '\n')
+  TRANS_PROMPT="Translate this research question to Swedish, keep proper names/URLs/technical terms: $QUERY"
+  TRANS_RESP=$(retry_with_backoff 2 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$TRANS_PROMPT" --model="$SYNTH_MODEL" --temperature=0.2 --max-tokens=200 --json 2>/dev/null || echo "")
+  SVQ=$(echo "$TRANS_RESP" | jq -r '.content // empty' 2>/dev/null | head -c 500 | tr -d '\n')
   if [ -n "$SVQ" ]; then QUERY="$SVQ"; fi
 fi
 
@@ -590,21 +586,14 @@ $SCORES_TXT
 Combined search results (incl full content excerpts where available):
 $(cat "$COMBINED")"
 
-  # Call synthesis model (P0-1: 8000 tokens)
-  SYNTH_PAYLOAD=$(jq -n \
-    --arg model "$SYNTH_MODEL" \
-    --arg prompt "$SYNTH_PROMPT" \
-    '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.4, max_tokens: 8000}')
-
-  SYNTH_RESPONSE=$(retry_with_backoff 3 1 curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
-    -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "$SYNTH_PAYLOAD") || {
+  # Call synthesis model (P0-1: 8000 tokens) via router
+  SYNTH_RESPONSE=$(retry_with_backoff 3 1 bin/llm-call --group=subagent-research-deep \
+    --prompt="$SYNTH_PROMPT" --model="$SYNTH_MODEL" --temperature=0.4 --max-tokens=8000 --json 2>/dev/null || echo "") || {
     log_event "retry" '{"stage":5,"target":"openrouter","result":"failed"}'
     SYNTH_RESPONSE=""
   }
 
-  REPORT=$(echo "$SYNTH_RESPONSE" | jq -r '.choices[0].message.content // empty')
+  REPORT=$(echo "$SYNTH_RESPONSE" | jq -r '.content // empty')
 
   if [ -z "$REPORT" ]; then
     echo "Synthesis failed. Response:" >&2
@@ -641,16 +630,9 @@ Task:
 - Flag UNSOURCED claims.
 - End with overall risk: low/med/high.
 Output ONLY starting with '## Confidence Audit' then list or table + summary."
-
-  AUDIT_PAYLOAD=$(jq -n \
-    --arg model "$SYNTH_MODEL" \
-    --arg prompt "$AUDIT_PROMPT" \
-    '{model: $model, messages: [{role: "user", content: $prompt}], temperature: 0.2, max_tokens: 2000}')
-  AUDIT_RESP=$(retry_with_backoff 2 1 curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
-    -H "Authorization: Bearer ${OPENROUTER_API_KEY}" \
-    -H "Content-Type: application/json" \
-    -d "$AUDIT_PAYLOAD" 2>/dev/null || echo "")
-  AUDIT=$(echo "$AUDIT_RESP" | jq -r '.choices[0].message.content // empty' | grep -A 200 '## Confidence Audit' || echo "")
+  AUDIT_RESP=$(retry_with_backoff 2 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$AUDIT_PROMPT" --model="$SYNTH_MODEL" --temperature=0.2 --max-tokens=2000 --json 2>/dev/null || echo "")
+  AUDIT=$(echo "$AUDIT_RESP" | jq -r '.content // empty' | grep -A 200 '## Confidence Audit' || echo "")
   if [ -n "$AUDIT" ]; then
     REPORT="$REPORT
 
@@ -771,10 +753,10 @@ fi
 if [ -n "$OUTPUT_SCHEMA" ] && [ -f "${OUTPUT_SCHEMA#@}" ]; then
   SCH=$(cat "${OUTPUT_SCHEMA#@}" 2>/dev/null || echo '{}')
   SCH_PROMPT="Given the report above, output ONLY valid JSON matching exactly this schema (no prose, no markdown):\n$SCH"
-  # simple follow-up call (reuse model)
-  SCH_PAY=$(jq -n --arg m "$SYNTH_MODEL" --arg p "$SCH_PROMPT" '{model:$m, messages:[{role:"user",content:$p}], temperature:0.1, max_tokens:1500}')
-  SCH_RESP=$(retry_with_backoff 1 1 curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" -H "Authorization: Bearer ${OPENROUTER_API_KEY}" -H "Content-Type: application/json" -d "$SCH_PAY" 2>/dev/null || echo "")
-  JSON_OUT=$(echo "$SCH_RESP" | jq -r '.choices[0].message.content // "{}"' | sed -n '/^```/!p' | head -c 8000)
+  # simple follow-up call (reuse model) via router
+  SCH_RESP=$(retry_with_backoff 1 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$SCH_PROMPT" --model="$SYNTH_MODEL" --temperature=0.1 --max-tokens=1500 --json 2>/dev/null || echo "")
+  JSON_OUT=$(echo "$SCH_RESP" | jq -r '.content // "{}"' | sed -n '/^```/!p' | head -c 8000)
   echo "$JSON_OUT" > "${OUTPUT_PATH%.md}.json" 2>/dev/null || true
   echo "Structured output: ${OUTPUT_PATH%.md}.json" >&2
 fi

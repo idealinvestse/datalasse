@@ -46,28 +46,16 @@ SYSTEM_PROMPT="You are a research strategist. Decompose the user's research ques
 
 USER_PROMPT="Research question: $QUERY. Return exactly $NUM_SUBQUERIES sub-queries as a JSON array."
 
-PAYLOAD=$(jq -n \
-  --arg model "$MODEL" \
-  --arg sys "$SYSTEM_PROMPT" \
-  --arg user "$USER_PROMPT" \
-  '{model: $model, messages: [{role: "system", content: $sys}, {role: "user", content: $user}], temperature: 0.3, max_tokens: 1500}')
-
-RESPONSE=$(curl -s -X POST "https://openrouter.ai/api/v1/chat/completions" \
-  -H "Authorization: Bearer $OR_KEY" \
-  -H "Content-Type: application/json" \
-  -d "$PAYLOAD")
-
-if echo "$RESPONSE" | jq -e '.error' >/dev/null 2>&1; then
-  echo "OpenRouter error:" >&2
-  echo "$RESPONSE" | jq -r '.error.message // .error' >&2
-  exit 1
-fi
-
-CONTENT=$(echo "$RESPONSE" | jq -r '.choices[0].message.content // empty')
+# Use internal LLM router (Phase 3). Preserves temperature, max_tokens, model override via --model=.
+# group=subagent-research-quick for free-first + telemetry/caps. Prefix strip handled inside.
+RESP=$(bin/llm-call --group=subagent-research-quick \
+  --prompt="$USER_PROMPT" --system="$SYSTEM_PROMPT" \
+  --model="$MODEL" --temperature=0.3 --max-tokens=1500 --json 2>/dev/null || echo "")
+CONTENT=$(echo "$RESP" | jq -r '.content // empty')
 
 if [ -z "$CONTENT" ]; then
   echo "Error: empty response from model" >&2
-  echo "$RESPONSE" | jq . >&2
+  echo "$RESP" | jq . >&2
   exit 1
 fi
 

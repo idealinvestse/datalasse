@@ -59,8 +59,10 @@ class InternalLLMRouter:
         system: str | None = None,
         max_tokens: int | None = None,
         extra: dict | None = None,
+        temperature: float | None = None,
+        model_override: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        """Main entry. Returns (content, meta)."""
+        """Main entry. Returns (content, meta). Supports optional temperature and model_override (forces model on tier-0 provider while keeping group policy/caps/telemetry)."""
         group_cfg = self.get_group(group)
         per_call_cap = float(group_cfg.get("cost_cap_per_call_usd", 0.001))
         per_hour_cap = float(group_cfg.get("cost_cap_per_hour_usd", 0.05))
@@ -83,15 +85,19 @@ class InternalLLMRouter:
             sel = self.select_tier_and_provider(group_cfg, tier_idx)
             mt = max_tokens or sel["max_tokens"]
             prov = sel["provider"]
-            mod = sel["model"]
+            mod = model_override or sel["model"]
+            if model_override:
+                # Pin to tier-0 provider for override (explicit model); no cross-provider escalation for forced model
+                prov = sel["provider"]
+                tier_idx = 0  # stay on first
             used_provider = prov
             used_model = mod
             attempts += 1
 
             # per-call guard
             est_max = sel.get("max_cost_usd") or per_call_cap
-            if est_max > per_call_cap:
-                # escalate early if tier too expensive for cap
+            if model_override is None and est_max > per_call_cap:
+                # escalate early if tier too expensive for cap (but honor explicit override)
                 tier_idx += 1
                 continue
 
@@ -101,14 +107,15 @@ class InternalLLMRouter:
                 if not allowed:
                     raise RuntimeError("hourly cost cap exceeded pre-call")
 
-                res = call_provider(prov, mod, messages, mt, self.cfg)
+                t = temperature if temperature is not None else 0.2
+                res = call_provider(prov, mod, messages, mt, self.cfg, temperature=t)
                 content = res["content"]
                 usage = res["usage"]
                 cost = calculate_cost(usage, mod)
                 used_cost = cost
 
                 # post call caps
-                if cost > per_call_cap:
+                if cost > per_call_cap and model_override is None:
                     append_telemetry({
                         "task_group": group,
                         "tier_index": tier_idx,
@@ -171,6 +178,8 @@ class InternalLLMRouter:
                     "error_class": err_class,
                     "call_id": str(uuid.uuid4())[:8],
                 }, self.cfg)
+                if model_override:
+                    break
                 if err_class in self.escalate_on or err_class == "cost_cap":
                     tier_idx += 1
                     continue
@@ -189,7 +198,9 @@ def call_group(
     system: str | None = None,
     max_tokens: int | None = None,
     config_path: str | None = None,
+    temperature: float | None = None,
+    model_override: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     """Convenience."""
     r = get_router(config_path)
-    return r.execute(group, prompt, system=system, max_tokens=max_tokens)
+    return r.execute(group, prompt, system=system, max_tokens=max_tokens, temperature=temperature, model_override=model_override)

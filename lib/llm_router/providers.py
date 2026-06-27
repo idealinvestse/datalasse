@@ -48,6 +48,7 @@ def call_provider(
     max_tokens: int,
     cfg: dict[str, Any],
     extra_headers: dict | None = None,
+    temperature: float = 0.2,
 ) -> dict[str, Any]:
     """Execute chat. Returns {'content': str, 'usage': dict, 'raw_model': , 'provider': , 'latency_ms': }"""
     start = time.time()
@@ -90,7 +91,7 @@ def call_provider(
             model=eff_model,
             messages=messages,  # type: ignore
             max_tokens=max_tokens,
-            temperature=0.2,
+            temperature=temperature,
             extra_headers=headers or None,
         )
         choice = resp.choices[0]
