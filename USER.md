@@ -5,7 +5,7 @@ _Learn about the person you're helping. Update this as you go._
 - **Name:** Oscar
 - **What to call them:** Osca
 - **Pronouns:** _(optional)_
-- **Timezone:**
+- **Timezone:** Europe/Stockholm (CEST/CET)
 - **Notes:**
 
 ## Context
