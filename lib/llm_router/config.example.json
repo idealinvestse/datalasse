@@ -1,0 +1,99 @@
+{
+  "version": "1.0",
+  "providers": {
+    "openrouter": {
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "default_headers": { "HTTP-Referer": "https://openclaw.internal", "X-Title": "OpenClaw-Internal" }
+    },
+    "groq": {
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY"
+    }
+  },
+  "groups": {
+    "cron-status-check": {
+      "description": "Heartbeat, secrets-validate, vps-snapshot (ultra-cheap, free-first)",
+      "cost_cap_per_call_usd": 0.0005,
+      "cost_cap_per_hour_usd": 0.01,
+      "default_max_tokens": 128,
+      "tiers": [
+        { "provider": "openrouter", "model": "liquid/lfm-2.5-1.2b-instruct:free", "max_tokens": 128, "max_cost_usd": 0.00005 },
+        { "provider": "groq", "model": "llama-3.1-8b-instant", "max_tokens": 256 },
+        { "provider": "openrouter", "model": "meta-llama/llama-3.2-3b-instruct:free", "max_tokens": 128 }
+      ]
+    },
+    "cron-classify": {
+      "description": "Log triage, alert routing, simple classification",
+      "cost_cap_per_call_usd": 0.001,
+      "cost_cap_per_hour_usd": 0.05,
+      "tiers": [
+        { "provider": "openrouter", "model": "cohere/north-mini-code:free", "max_tokens": 256 },
+        { "provider": "groq", "model": "llama-3.1-8b-instant", "max_tokens": 512 },
+        { "provider": "openrouter", "model": "inclusionai/ling-2.6-flash", "max_tokens": 512 }
+      ]
+    },
+    "subagent-research-quick": {
+      "description": "Fast factual sub-agents (Serper/Exa style)",
+      "cost_cap_per_call_usd": 0.002,
+      "cost_cap_per_hour_usd": 0.20,
+      "tiers": [
+        { "provider": "openrouter", "model": "google/gemma-4-31b-it:free", "max_tokens": 1024 },
+        { "provider": "openrouter", "model": "liquid/lfm-2.5-1.2b-thinking:free", "max_tokens": 1024 },
+        { "provider": "groq", "model": "openai/gpt-oss-20b", "max_tokens": 1536 }
+      ]
+    },
+    "subagent-research-deep": {
+      "description": "Deep synthesis (no free; quality bar higher)",
+      "cost_cap_per_call_usd": 0.05,
+      "cost_cap_per_hour_usd": 1.00,
+      "tiers": [
+        { "provider": "openrouter", "model": "openrouter/deepseek/deepseek-v4-pro", "max_tokens": 4000 },
+        { "provider": "groq", "model": "llama-3.3-70b-versatile", "max_tokens": 4096 },
+        { "provider": "openrouter", "model": "openrouter/qwen/qwen3.6-35b-a3b", "max_tokens": 4096 }
+      ]
+    },
+    "subagent-code-quick": {
+      "description": "Small edits, fixes, patches",
+      "cost_cap_per_call_usd": 0.01,
+      "cost_cap_per_hour_usd": 0.30,
+      "tiers": [
+        { "provider": "groq", "model": "openai/gpt-oss-20b", "max_tokens": 2048 },
+        { "provider": "openrouter", "model": "qwen/qwen3-coder-30b-a3b-instruct", "max_tokens": 2048 }
+      ]
+    },
+    "subagent-code-deep": {
+      "description": "Multi-file refactors, plans",
+      "cost_cap_per_call_usd": 0.08,
+      "cost_cap_per_hour_usd": 0.80,
+      "tiers": [
+        { "provider": "openrouter", "model": "openrouter/x-ai/grok-4.3", "max_tokens": 8192 },
+        { "provider": "groq", "model": "openai/gpt-oss-120b", "max_tokens": 8192 }
+      ]
+    },
+    "planning-grok": {
+      "description": "grok-build full plan generation (longer context)",
+      "cost_cap_per_call_usd": 0.10,
+      "cost_cap_per_hour_usd": 0.50,
+      "tiers": [
+        { "provider": "openrouter", "model": "openrouter/x-ai/grok-4.3", "max_tokens": 16384 },
+        { "provider": "openrouter", "model": "openrouter/qwen/qwen3-next-80b-a3b-thinking", "max_tokens": 8192 }
+      ]
+    },
+    "interactive-synthesis": {
+      "description": "Main session synthesis touching owner (conservative)",
+      "cost_cap_per_call_usd": 0.15,
+      "cost_cap_per_hour_usd": 2.00,
+      "tiers": [
+        { "provider": "openrouter", "model": "openrouter/anthropic/claude-sonnet-4.6", "max_tokens": 8192 },
+        { "provider": "openrouter", "model": "openrouter/x-ai/grok-4.20", "max_tokens": 8192 }
+      ]
+    }
+  },
+  "policy": {
+    "max_tier_jumps": 2,
+    "escalate_on": ["rate_limit", "timeout", "server_error", "cost_cap"],
+    "quality_heuristic": false,
+    "telemetry_dir": "memory/research"
+  }
+}

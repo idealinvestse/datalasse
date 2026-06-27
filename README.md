@@ -26,6 +26,8 @@ For the full operating contract, see **[AGENTS.md](./AGENTS.md)**.
 | `skills/`           | 10 skills, each with `SKILL.md` + support files |
 | `bin/`              | Shell scripts (research pipeline, watchdog, vps snapshot, etc.) |
 | `lib/`              | Local shell libs shared between bins |
+| `lib/llm_router/`   | Internal LLM router (Phase 1): 8 task groups, free-first, escalation, telemetry |
+| `bin/llm-call`      | CLI wrapper for internal router (`--group=<name> --prompt="..."`) |
 | `examples/`         | 3 example projects (LemonCake MCP, MossRouter, MossRouter MCP) |
 | `docs/`             | Domain research (MVP specs, bygglov analysis) |
 

@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# bin/llm-call --group=<name> --prompt="..." [--dry-run] [--json] [--max-tokens=N]
+#
+# Thin wrapper for internal LLM router (Phase 1 per plan).
+# Loads secrets if present (like other bins), sets PYTHONPATH, calls python cli.
+# Dry-run shows selection without API use.
+set -euo pipefail
+
+cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# Try to load keys (non-fatal)
+if [[ -f bin/load-secrets ]]; then
+  eval "$(bin/load-secrets 2>/dev/null || true)" || true
+fi
+
+PYTHONPATH="${PYTHONPATH:-}:." python3 -m lib.llm_router.cli "$@"

@@ -239,6 +239,16 @@ The goal: Be helpful without being annoying. Check in a few times a day, do usef
 
 This is a starting point. Add your own conventions, style, and rules as you figure out what works.
 
+## Internal LLM Router (Phase 1)
+
+Moss's internal tasks (cron jobs, subagent dispatches, grok-build planning) route LLM calls via named task groups. See **TOOLS.md → Internal LLM Router** for groups + usage.
+
+- Default: `bin/llm-call --group=<name> --prompt="..." [--dry-run] [--json]`
+- Free-first per group (OpenRouter `:free` / Groq compound), auto-escalates on 429/5xx/timeout/cost-cap.
+- Per-call + per-hour USD caps, JSONL telemetry → `memory/research/llm-router-telemetry-YYYY-MM-DD.jsonl`.
+- **Opt-in**: cron scripts and subagents call the helper explicitly; no implicit rewiring.
+- MOCK mode: `MOCK=1 bin/llm-call ...` (deterministic, zero net, for tests + dry-run).
+
 ## Related
 
 - [Default AGENTS.md](/reference/AGENTS.default)

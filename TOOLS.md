@@ -95,6 +95,26 @@ Research workflows using Brave (via `web_search`):
 
 
 
+## Internal LLM Router (Phase 1, 2026-06-27)
+
+CLI helper: `bin/llm-call --group=<name> --prompt="..." [--dry-run] [--json]`
+
+| Task group | Default first tier | Cost cap/call | Cost cap/hour | Use case |
+|---|---|---|---|---|
+| `cron-status-check` | `liquid/lfm-2.5-1.2b-instruct:free` (OR) | $0.0005 | $0.01 | Heartbeat, secrets-validate, vps-snapshot |
+| `cron-classify` | `cohere/north-mini-code:free` (OR) | $0.001 | $0.05 | Log triage, alert routing |
+| `subagent-research-quick` | `google/gemma-4-31b-it:free` (OR) | $0.002 | $0.20 | Fast factual sub-agents |
+| `subagent-research-deep` | `deepseek/deepseek-v4-pro` (OR) | $0.05 | $1.00 | Deep synthesis |
+| `subagent-code-quick` | `openai/gpt-oss-20b` (Groq) | $0.01 | $0.30 | Small edits, fixes |
+| `subagent-code-deep` | `grok-4.3` (OR) | $0.08 | $0.80 | Multi-file refactor, plans |
+| `planning-grok` | `grok-4.3` (OR) | $0.10 | $0.50 | grok-build full plan tasks |
+| `interactive-synthesis` | `claude-sonnet-4.6` (OR) | $0.15 | $2.00 | Main session synthesis |
+
+- Free-first: each group defaults to free tier, escalates on 429/5xx/timeout/cost-cap (max 2 jumps).
+- Telemetry: JSONL per call → `memory/research/llm-router-telemetry-YYYY-MM-DD.jsonl`. Rollup: `bin/llm-call --group=<g> --prompt="x" --rollup`.
+- MOCK: `MOCK=1 bin/llm-call ...` for deterministic zero-cost path.
+- Tests: `MOCK=1 python3 -m pytest tests/test_internal_router.py tests/test_internal_router_integration.py -v` (9/9).
+
 ## Groq i OpenClaw (2026-06-23)
 
 **Alla 17 Groq-modeller** valbara som `groq/<model>` i OpenClaw. Plugin redan bundled.
