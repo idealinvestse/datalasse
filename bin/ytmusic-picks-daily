@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# ytmusic-moss daily picks cron
+# Runs at 09:00 UTC (after Mossfund status, before research-discover)
+# Calls /picks on local service and sends formatted message to Telegram.
+set -euo pipefail
+
+WS=/root/.openclaw/workspace
+YTMUSIC_BIN="$WS/bin/ytmusic"
+LOG="$WS/.ytmusic-picks-daily.log"
+LOG_FMT="$WS/.ytmusic-picks.log"
+DATE=$(date -u +%Y-%m-%d)
+HOUR=$(date -u +%H)
+TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+YTMUSIC_URL="${YTMUSIC_URL:-http://127.0.0.1:8088}"
+export YTMUSIC_URL
+
+mkdir -p "$(dirname "$LOG")"
+echo "[$TS] ytmusic-picks-daily start" >> "$LOG"
+
+# 1. Health check — skip if service down (don't spam errors)
+HEALTH=$(curl -s --max-time 5 "${YTMUSIC_URL}/health" 2>/dev/null || echo "")
+if [ -z "$HEALTH" ] || ! echo "$HEALTH" | grep -q '"ok":true' 2>/dev/null; then
+  echo "[$TS] service unreachable (url=$YTMUSIC_URL)" >> "$LOG"
+  exit 0
+fi
+
+# 2. Fetch picks (JSON)
+PICKS_JSON=$(YTMUSIC_BIN="$YTMUSIC_BIN" "$YTMUSIC_BIN" picks 5 2>/dev/null || echo "")
+if [ -z "$PICKS_JSON" ]; then
+  echo "[$TS] picks empty/failed" >> "$LOG"
+  exit 0
+fi
+
+# 3. Format for Telegram (compact)
+MSG=$(python3 <<PY
+import json, sys, os
+try:
+    data = json.loads('''$PICKS_JSON''')
+except Exception as e:
+    print(f"Moss picks misslyckades: {e}")
+    sys.exit(0)
+picks = data.get("picks") or []
+if not picks:
+    print("Inga picks idag.")
+    sys.exit(0)
+lines = ["🌿 **Moss picks — $DATE**", ""]
+for i, s in enumerate(picks, 1):
+    title = s.get("title") or "?"
+    artists = ", ".join(s.get("artists") or []) or "?"
+    dur = s.get("duration") or ""
+    vid = s.get("videoId") or ""
+    line = f"{i}. {title} — {artists}"
+    if dur:
+        line += f"  ({dur})"
+    if vid:
+        line += f"\n   [videoId: {vid}]"
+    lines.append(line)
+lines.append("")
+lines.append("💬 Säg 'yt radio <låt>' för mer i samma stil, eller 'yt picks' när du vill ha fler.")
+print("\n".join(lines))
+PY
+)
+
+# 4. Send to Telegram via openclaw message tool
+openclaw message send \
+  --channel telegram \
+  --target 438805461 \
+  --message "$MSG" >> "$LOG_FMT" 2>&1 || echo "send failed" >> "$LOG"
+
+echo "[$TS] ytmusic-picks-daily done ($(echo "$MSG" | wc -c) bytes)" >> "$LOG"

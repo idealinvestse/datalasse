@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""ytmusic-moss CLI wrapper for Moss chat.
+
+Usage:
+    ytmusic search <query> [songs|albums|artists|playlists]
+    ytmusic mood [query]
+    ytmusic charts [country]
+    ytmusic radio <seed>
+    ytmusic artist <name>
+    ytmusic album <name>
+    ytmusic library
+    ytmusic playlists
+    ytmusic liked [N]
+    ytmusic history [N]
+    ytmusic like <videoId>
+    ytmusic unlike <videoId>
+    ytmusic picks [N]
+    ytmusic health
+    ytmusic auth
+
+Talks to local FastAPI service at $YTMUSIC_URL (default http://127.0.0.1:8088).
+Outputs compact JSON for Moss to rephrase, or human-readable on --pretty.
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import urllib.parse
+from urllib import request as urlrequest
+from urllib.error import HTTPError, URLError
+
+BASE = os.environ.get("YTMUSIC_URL", "http://127.0.0.1:8088").rstrip("/")
+
+
+def _call(method: str, path: str, payload: dict | None = None, params: dict | None = None) -> dict:
+    url = BASE + path
+    if params:
+        url += "?" + urllib.parse.urlencode({k: v for k, v in params.items() if v is not None})
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urlrequest.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urlrequest.urlopen(req, timeout=30) as r:
+            body = r.read().decode("utf-8")
+            return json.loads(body) if body else {}
+    except HTTPError as e:
+        body = e.read().decode("utf-8", errors="ignore")
+        return {"ok": False, "error": f"HTTP {e.code}: {body[:200]}"}
+    except URLError as e:
+        return {"ok": False, "error": f"connection: {e.reason}"}
+
+
+def _format_song(s: dict) -> str:
+    artists = ", ".join(s.get("artists") or []) or s.get("artist", "") or "?"
+    dur = s.get("duration") or ""
+    vid = s.get("videoId", "")
+    title = s.get("title", "?")
+    line = f"  • {title} — {artists}"
+    if dur:
+        line += f" ({dur})"
+    if vid:
+        line += f"  [{vid}]"
+    return line
+
+
+def cmd_search(args: list[str], pretty: bool) -> int:
+    flt = None
+    if args and args[-1] in {"songs", "albums", "artists", "playlists", "videos"}:
+        flt = args.pop()
+    q = " ".join(args).strip()
+    if not q:
+        print("query required", file=sys.stderr)
+        return 2
+    r = _call("POST", "/search", {"query": q, "filter": flt})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    results = (r.get("data") or {}).get("results") or []
+    if pretty:
+        print(f'🔍 "{q}"' + (f" [{flt}]" if flt else ""))
+        if not results:
+            print("  (inga resultat)")
+        for s in results[:10]:
+            print(_format_song(s))
+    else:
+        print(json.dumps({"q": q, "filter": flt, "results": results[:20]}, ensure_ascii=False))
+    return 0
+
+
+def cmd_mood(args: list[str], pretty: bool) -> int:
+    q = " ".join(args).strip()
+    r = _call("POST", "/mood", {"query": q})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    pls = (r.get("data") or {}).get("playlists") or []
+    if pretty:
+        print(f"🎵 Mood: '{q or '(default)'}'")
+        if not pls:
+            print("  (inga spellistor)")
+        for p in pls[:10]:
+            print(f"  • {p.get('title')}  ({p.get('trackCount', '?')} spår)  [{p.get('playlistId')}]")
+    else:
+        print(json.dumps({"query": q, "playlists": pls}, ensure_ascii=False))
+    return 0
+
+
+def cmd_charts(args: list[str], pretty: bool) -> int:
+    country = args[0].upper() if args else "SE"
+    r = _call("GET", "/charts", params={"country": country})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    d = r.get("data") or {}
+    if pretty:
+        print(f"📊 Charts {country}")
+        for t in d.get("tracks", [])[:10]:
+            print(_format_song(t))
+        artists = d.get("artists") or []
+        if artists:
+            print("\nTop artists:")
+            for a in artists[:10]:
+                print(f"  • {a.get('title') or a.get('name', '?')}  [{a.get('artistId') or a.get('browseId', '')}]")
+    else:
+        print(json.dumps(d, ensure_ascii=False))
+    return 0
+
+
+def cmd_radio(args: list[str], pretty: bool) -> int:
+    seed = " ".join(args).strip()
+    if not seed:
+        print("seed required (låt/artist/videoId)", file=sys.stderr)
+        return 2
+    r = _call("POST", "/radio", {"seed": seed})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    q = (r.get("data") or {})
+    tracks = q.get("queue") or q.get("tracks") or []
+    if pretty:
+        print(f"📻 Radio från '{seed}' — {len(tracks)} spår")
+        for t in tracks[:15]:
+            print(_format_song(t))
+    else:
+        print(json.dumps({"seed": seed, "queue": tracks}, ensure_ascii=False))
+    return 0
+
+
+def cmd_artist(args: list[str], pretty: bool) -> int:
+    name = " ".join(args).strip()
+    if not name:
+        print("name required", file=sys.stderr)
+        return 2
+    r = _call("GET", "/artist", params={"name": name})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    d = r.get("data") or {}
+    if pretty:
+        info = d.get("info") or {}
+        print(f"🎤 {info.get('name') or name}")
+        if info.get("description"):
+            print(f"   {info['description'][:200]}")
+        if info.get("subscribers"):
+            print(f"   Subscribers: {info['subscribers']}")
+        top = d.get("topSongs") or []
+        if top:
+            print("\nTop songs:")
+            for s in top[:8]:
+                print(_format_song(s))
+        rel = d.get("related") or []
+        if rel:
+            print("\nRelated artists:")
+            for a in rel[:5]:
+                print(f"  • {a.get('title') or a.get('name', '?')}")
+    else:
+        print(json.dumps(d, ensure_ascii=False))
+    return 0
+
+
+def cmd_album(args: list[str], pretty: bool) -> int:
+    name = " ".join(args).strip()
+    if not name:
+        print("name required", file=sys.stderr)
+        return 2
+    r = _call("GET", "/album", params={"name": name})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    d = r.get("data") or {}
+    if pretty:
+        alb = d.get("album") or {}
+        print(f"💿 {alb.get('title') or name} — {alb.get('artist', '')}")
+        tracks = d.get("tracks") or []
+        for i, t in enumerate(tracks, 1):
+            print(f"  {i:2}. {t.get('title', '?')} ({t.get('duration', '')})  [{t.get('videoId', '')}]")
+    else:
+        print(json.dumps(d, ensure_ascii=False))
+    return 0
+
+
+def cmd_library(_args: list[str], pretty: bool) -> int:
+    r = _call("GET", "/library")
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    d = r.get("data") or {}
+    if pretty:
+        print("📚 Bibliotek")
+        print(f"  Spellistor: {d.get('playlistsCount', '?')}")
+        print(f"  Gillade låtar: {d.get('likedCount', '?')}")
+        print(f"  Prenumerationer: {d.get('subscriptionsCount', '?')}")
+        if d.get("warning"):
+            print(f"  ⚠️  {d['warning']}")
+    else:
+        print(json.dumps(d, ensure_ascii=False))
+    return 0
+
+
+def cmd_playlists(_args: list[str], pretty: bool) -> int:
+    r = _call("GET", "/playlists")
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    pls = (r.get("data") or {}).get("playlists") or []
+    if pretty:
+        print(f"📋 Dina spellistor ({len(pls)})")
+        for p in pls[:20]:
+            print(f"  • {p.get('title')}  ({p.get('count', '?')} spår)")
+    else:
+        print(json.dumps({"playlists": pls}, ensure_ascii=False))
+    return 0
+
+
+def cmd_liked(args: list[str], pretty: bool) -> int:
+    limit = int(args[0]) if args else 20
+    r = _call("GET", "/liked", params={"limit": limit})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    songs = (r.get("data") or {}).get("songs") or []
+    if pretty:
+        print(f"❤️  Gillade låtar ({len(songs)})")
+        for s in songs[:20]:
+            print(_format_song(s))
+    else:
+        print(json.dumps({"songs": songs}, ensure_ascii=False))
+    return 0
+
+
+def cmd_history(args: list[str], pretty: bool) -> int:
+    limit = int(args[0]) if args else 20
+    r = _call("GET", "/history", params={"limit": limit})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    recent = (r.get("data") or {}).get("recent") or []
+    if pretty:
+        print(f"🕒 Historik ({len(recent)})")
+        for s in recent[:20]:
+            print(_format_song(s))
+    else:
+        print(json.dumps({"recent": recent}, ensure_ascii=False))
+    return 0
+
+
+def cmd_picks(args: list[str], pretty: bool) -> int:
+    limit = int(args[0]) if args else 5
+    r = _call("GET", "/picks", params={"limit": limit})
+    if not r.get("ok"):
+        print(f"❌ {r.get('error')}")
+        return 1
+    picks = (r.get("data") or {}).get("picks") or []
+    if pretty:
+        print("🌿 Moss picks")
+        for i, s in enumerate(picks, 1):
+            print(f"  {i}. {_format_song(s).strip()}")
+        warn = r.get("warning")
+        if warn:
+            print(f"\n  ⚠️  {warn}")
+    else:
+        print(json.dumps({"picks": picks}, ensure_ascii=False))
+    return 0
+
+
+def cmd_like(args: list[str], _pretty: bool) -> int:
+    vid = args[0] if args else ""
+    if not vid:
+        print("videoId required", file=sys.stderr)
+        return 2
+    r = _call("POST", "/like", {"videoId": vid})
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_unlike(args: list[str], _pretty: bool) -> int:
+    vid = args[0] if args else ""
+    if not vid:
+        print("videoId required", file=sys.stderr)
+        return 2
+    r = _call("POST", "/unlike", {"videoId": vid})
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_health(_args: list[str], _pretty: bool) -> int:
+    r = _call("GET", "/health")
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
+
+
+def cmd_auth(_args: list[str], _pretty: bool) -> int:
+    r = _call("GET", "/auth-status")
+    print(json.dumps(r, ensure_ascii=False))
+    return 0 if r.get("ok") else 1
+
+
+COMMANDS = {
+    "search": cmd_search, "s": cmd_search,
+    "mood": cmd_mood, "m": cmd_mood,
+    "charts": cmd_charts, "c": cmd_charts,
+    "radio": cmd_radio, "r": cmd_radio,
+    "artist": cmd_artist, "a": cmd_artist,
+    "album": cmd_album,
+    "library": cmd_library, "lib": cmd_library,
+    "playlists": cmd_playlists, "pls": cmd_playlists,
+    "liked": cmd_liked,
+    "history": cmd_history, "hist": cmd_history,
+    "picks": cmd_picks,
+    "like": cmd_like,
+    "unlike": cmd_unlike,
+    "health": cmd_health,
+    "auth": cmd_auth,
+}
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in {"-h", "--help"}:
+        print(__doc__)
+        print("\nKommandon:", ", ".join(sorted(set(COMMANDS.keys()))))
+        return 0 if len(argv) >= 2 else 2
+    cmd = argv[1].lower()
+    args = argv[2:]
+    pretty = "--pretty" in args or os.isatty(1)
+    args = [a for a in args if a != "--pretty"]
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        print(f"unknown command: {cmd}. Try: ytmusic health", file=sys.stderr)
+        return 2
+    return fn(args, pretty)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
