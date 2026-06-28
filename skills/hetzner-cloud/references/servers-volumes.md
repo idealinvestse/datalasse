@@ -36,12 +36,25 @@ bin/hcloud-cli server resize my-app --type cpx31 --upgrade-disk --yes
 
 ## Reverse DNS (PTR)
 
-Required for mail deliverability when sending from the VPS IP.
+Set PTR records so that reverse DNS for the server IP resolves to your FQDN.
+Critical for outbound mail reputation (most SMTP receivers check `iprev`).
+
+### Multi-project gotcha
+
+rDNS lives in the project that **owns the server**, not the DNS project. If
+your Hetzner DNS zones are in one project and servers in another, use the
+matching `--project`:
 
 ```bash
-bin/hcloud-cli server rdns get vps-agent-1 --json
-bin/hcloud-cli server rdns set vps-agent-1 --ip 167.233.38.175 --ptr mail.intelliserve.se
-bin/hcloud-cli server rdns reset vps-agent-1 --ip 167.233.38.175 --yes
+bin/hcloud-cli --project=vps server rdns get vps-agent-1 --json
+bin/hcloud-cli --project=vps server rdns set vps-agent-1 --ip 167.233.38.175 --ptr mail.intelliserve.se
+bin/hcloud-cli --project=vps server rdns reset vps-agent-1 --ip 167.233.38.175 --yes
+```
+
+Verify propagation (TTL is typically 3600s):
+
+```bash
+dig +short @1.1.1.1 -x 167.233.38.175  # should return mail.intelliserve.se.
 ```
 
 ## Volumes

@@ -28,7 +28,9 @@ from _common import (  # noqa: E402
     firewall_to_dict,
     floating_ip_to_dict,
     get_client,
+    get_token,
     image_to_dict,
+    list_projects,
     network_to_dict,
     normalize_record_name,
     require_yes,
@@ -55,6 +57,14 @@ def _add_globals(p: argparse.ArgumentParser) -> None:
     p.add_argument("--yes", action="store_true", help="Confirm destructive operations")
     p.add_argument("--dry-run", action="store_true", help="Show intent without writes")
     p.add_argument("--zone", help="Default DNS zone (overrides HCLOUD_DEFAULT_ZONE)")
+    p.add_argument(
+        "--project",
+        help=(
+            "Hetzner Cloud project to target. Each project has its own API "
+            "token (registered in ~/.config/moss/hcloud-projects.env). "
+            "Overrides HCLOUD_PROJECT_NAME / HCLOUD_DEFAULT_PROJECT."
+        ),
+    )
 
 
 def _parse_record_values(rtype: str, values: list[str]) -> list[ZoneRecord]:
@@ -77,14 +87,18 @@ def _check_protected(rtype: str, force: bool) -> None:
 
 
 def cmd_status(_args: argparse.Namespace) -> None:
+    token, project_name = get_token()
     client = get_client()
     zones = client.zones.get_all()
     servers = client.servers.get_all()
     emit_ok(
         {
             "authenticated": True,
+            "project": project_name,
+            "token_chars": len(token),
             "zones": len(zones),
             "servers": len(servers),
+            "available_projects": list_projects(),
         }
     )
 
@@ -890,13 +904,14 @@ def main() -> None:
 
     parser = build_parser()
     args = parser.parse_args(argv)
-    for key in ("json", "yes", "dry_run", "zone"):
+    for key in ("json", "yes", "dry_run", "zone", "project"):
         setattr(args, key, getattr(pre_args, key) or getattr(args, key, None))
 
     OPTS.json_out = args.json
     OPTS.yes = args.yes
     OPTS.dry_run = args.dry_run
     OPTS.default_zone = args.zone
+    OPTS.project = args.project
     try:
         args.func(args)
     except CliError as exc:

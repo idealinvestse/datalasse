@@ -74,11 +74,11 @@ Hanterade via Hetzner DNS (CLI: `skills/hetzner-cloud/bin/hcloud-cli record …`
 | TXT | @ | `v=spf1 mx a -all` | ✅ (lagt 2026-06-29) |
 | TXT | dkim._domainkey | DKIM pubkey från Mailcow API (multi-string) | ✅ (lagt 2026-06-29) |
 | TXT | _dmarc | `v=DMARC1; p=reject; rua=mailto:postmaster@intelliserve.se; …` | ✅ (lagt 2026-06-29) |
-| PTR | 167.233.38.175 | → mail.intelliserve.se | ⚠️ **TODO** (Hetzner Cloud Console — separat projekt) |
+| PTR | 167.233.38.175 | → mail.intelliserve.se | ✅ (satt 2026-06-29 via `hcloud-cli --project=vps server rdns set`) |
 
 **Verifiering:** `dig +short @1.1.1.1 {intelliserve.se,_dmarc.intelliserve.se,dkim._domainkey.intelliserve.se} TXT` och `dig +short intelliserve.se MX`.
 
-**rDNS / PTR:** Sätts i Hetzner Cloud Console → Servers → `vps-agent-1` → RDNS → peka `mail.intelliserve.se` på IP `167.233.38.175`. Nuvarande PTR (`static.175.38.233.167.clients.your-server.de.`) ger dålig spam-score. **HCLOUD_TOKEN vi har tillgång till tillhör ett separat projekt utan `vps-agent-1`.**
+**rDNS / PTR:** Sätts via `hcloud-cli --project=vps server rdns set vps-agent-1 --ip 167.233.38.175 --ptr mail.intelliserve.se`. Nuvarande PTR är `mail.intelliserve.se.` (verifierat 2026-06-29 via Cloudflare/Google/Quad9).
 
 **Backup:** Zon exporterad till `/tmp/intelliserve.se.zone.bak.YYYYMMDD-HHMMSS` innan ändringar.
 | TXT | intelliserve.se | SPF/DKIM/DMARC — hämta från Mailcow admin → DNS |
@@ -86,12 +86,17 @@ Hanterade via Hetzner DNS (CLI: `skills/hetzner-cloud/bin/hcloud-cli record …`
 ## Hetzner Cloud (`hetzner-cloud` skill)
 
 - **CLI:** `skills/hetzner-cloud/bin/hcloud-cli`
-- **Skill:** `hetzner-cloud` (aktiverad) — DNS, servrar, volumes, firewalls, rDNS
-- **Token:** `HCLOUD_TOKEN` permanent lagrad i `~/.config/moss/secrets.env` (mode 600) + speglad i `openclaw.json` → `env.vars` (skapa i Hetzner Cloud Console → Security → API tokens)
+- **Skill:** `hetzner-cloud` (aktiverad) — DNS, servrar, volumes, firewalls, rDNS, **multi-account**
+- **Multi-project token registry:** `~/.config/moss/hcloud-projects.env` (mode 600)
+  - `HCLOUD_PROJECT_DNS='...'` — intelliserve-prod (8 zoner)
+  - `HCLOUD_PROJECT_VPS='...'` — vps-agent-1-projektet (servers + rDNS)
+  - `HCLOUD_DEFAULT_PROJECT='dns'`
+- **Användning:** `hcloud-cli --project=vps server list` eller sätt `HCLOUD_PROJECT_NAME=vps` (legacy `HCLOUD_TOKEN` funkar fortfarande som fallback)
 - **Default zone:** `HCLOUD_DEFAULT_ZONE=intelliserve.se`
 - **Setup venv:** `cd skills/hetzner-cloud && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
-- **Verifiering:** `skills/hetzner-cloud/bin/hcloud-cli status --json`
-- **Health monitor:** `bin/secrets-validate` (hourly cron) — validerar längd (≥60), regex, och live API-probe mot `/v1/datacenters`
+- **Verifiering:** `skills/hetzner-cloud/bin/hcloud-cli status --json` → visar aktivt projekt + lista över tillgängliga projekt
+- **Auto-resolve by zone:** om `--zone NAME` inte finns i aktivt projekt men finns i ett annat → CLI:et föreslår `--project=<name>`
+- **Health monitor:** `bin/secrets-validate` (hourly cron) — validerar **alla registrerade projekt** mot `/v1/datacenters`
 
 ## Grok Build
 

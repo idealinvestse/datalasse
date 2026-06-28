@@ -33,23 +33,162 @@ class GlobalOpts:
     yes: bool = False
     dry_run: bool = False
     default_zone: str | None = None
+    project: str | None = None
 
 
 OPTS = GlobalOpts()
 
+# Path to multi-project token registry. Loaded on first use.
+_PROJECTS_ENV_PATH = os.path.expanduser("~/.config/moss/hcloud-projects.env")
+_projects_cache: dict[str, str] | None = None
 
-def get_client() -> Client:
-    token = os.environ.get("HCLOUD_TOKEN", "").strip()
-    if not token:
+
+def _load_projects() -> dict[str, str]:
+    """Load the multi-project token registry.
+
+    Reads `~/.config/moss/hcloud-projects.env` (mode 600) if it exists,
+    parsing HCLOUD_PROJECT_<NAME>=TOKEN lines into a dict.
+
+    Falls back gracefully (empty dict) if the file is missing.
+    """
+    global _projects_cache
+    if _projects_cache is not None:
+        return _projects_cache
+
+    projects: dict[str, str] = {}
+    if not os.path.exists(_PROJECTS_ENV_PATH):
+        _projects_cache = projects
+        return projects
+
+    try:
+        with open(_PROJECTS_ENV_PATH, "r", encoding="utf-8") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):]
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip()
+                # Strip surrounding quotes (single or double)
+                if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                    val = val[1:-1]
+                if key.startswith("HCLOUD_PROJECT_") and key != "HCLOUD_PROJECT_NAME":
+                    name = key[len("HCLOUD_PROJECT_"):].lower()
+                    projects[name] = val
+    except OSError as exc:
         raise CliError(
-            "HCLOUD_TOKEN is not set",
-            hint="Create an API token in Hetzner Cloud Console → Security → API tokens",
-        )
+            f"Cannot read {_PROJECTS_ENV_PATH}",
+            hint=str(exc),
+        ) from exc
+
+    _projects_cache = projects
+    return projects
+
+
+def list_projects() -> list[str]:
+    """Return names of all registered projects."""
+    return sorted(_load_projects().keys())
+
+
+def get_token(project: str | None = None) -> tuple[str, str]:
+    """Resolve (token, project_name) for the requested project.
+
+    Lookup order:
+    1. Explicit --project / HCLOUD_PROJECT_NAME
+    2. HCLOUD_DEFAULT_PROJECT env var
+    3. HCLOUD_TOKEN env var (legacy single-project mode)
+    4. 'dns' if exactly one project is registered
+    """
+    projects = _load_projects()
+
+    # 1. Explicit override
+    if project is None:
+        project = OPTS.project
+    if project is None:
+        project = os.environ.get("HCLOUD_PROJECT_NAME")
+    if project is not None:
+        name = project.lower()
+        if name not in projects:
+            raise CliError(
+                f"Unknown project: {project!r}",
+                hint=f"Available: {', '.join(list_projects()) or '(none registered)'}",
+            )
+        return projects[name], name
+
+    # 2. HCLOUD_DEFAULT_PROJECT
+    default = os.environ.get("HCLOUD_DEFAULT_PROJECT", "").strip().lower()
+    if default and default in projects:
+        return projects[default], default
+
+    # 3. Legacy HCLOUD_TOKEN fallback
+    legacy = os.environ.get("HCLOUD_TOKEN", "").strip()
+    if legacy:
+        return legacy, "<legacy>"
+
+    # 4. Single registered project — use it as default
+    if len(projects) == 1:
+        only_name = next(iter(projects))
+        return projects[only_name], only_name
+
+    # 5. None registered — error
+    raise CliError(
+        "No project resolved",
+        hint=(
+            "Pass --project=<name>, set HCLOUD_PROJECT_NAME, or register a "
+            f"token in {_PROJECTS_ENV_PATH}"
+        ),
+    )
+
+
+def get_client(project: str | None = None) -> Client:
+    """Return an authenticated hcloud.Client.
+
+    Pass an explicit project name to target a specific Hetzner Cloud project.
+    Without args, resolves via OPTS.project / HCLOUD_PROJECT_NAME /
+    HCLOUD_DEFAULT_PROJECT / HCLOUD_TOKEN (legacy) / single-registered-project.
+    """
+    token, name = get_token(project)
     return Client(
         token=token,
         application_name=APP_NAME,
         application_version=APP_VERSION,
     )
+
+
+def find_zone_owner(zone_name: str) -> str | None:
+    """Return the project name that owns the given DNS zone, or None.
+
+    Hetzner DNS zone names are globally unique across projects, so we probe
+    each registered project until one returns the zone. Probes are cached
+    per-zone-name for the lifetime of the process.
+    """
+    projects = _load_projects()
+    if not projects:
+        return None
+    # Avoid resolving the project that already owns the requested project
+    # (no-op pass-through in most calls).
+    from functools import lru_cache  # local import: keep module load fast
+
+    @lru_cache(maxsize=64)
+    def _lookup(name: str) -> str | None:
+        for proj_name, tok in projects.items():
+            try:
+                client = Client(
+                    token=tok,
+                    application_name=APP_NAME,
+                    application_version=APP_VERSION,
+                )
+                client.zones.get(name)
+                return proj_name
+            except Exception:
+                continue
+        return None
+
+    return _lookup(zone_name)
 
 
 def require_yes(action: str) -> None:
@@ -86,6 +225,22 @@ def zone_name(opts_zone: str | None) -> str:
     return name
 
 
+def resolve_zone(client: Client, name: str):
+    try:
+        return client.zones.get(name)
+    except Exception as exc:
+        # If this is a multi-project setup and the zone isn't in the current
+        # project, try the other projects before giving up.
+        if OPTS.project is None and os.environ.get("HCLOUD_PROJECT_NAME") is None:
+            owner = find_zone_owner(name)
+            if owner is not None:
+                raise CliError(
+                    f"Zone {name!r} not in current project, but found in --project={owner}",
+                    hint=f"Re-run with --project={owner}",
+                )
+        raise CliError(f"Zone not found: {name}", hint=str(exc)) from exc
+
+
 def resolve_server(client: Client, ref: str):
     if ref.isdigit():
         return client.servers.get_by_id(int(ref))
@@ -93,13 +248,6 @@ def resolve_server(client: Client, ref: str):
     if server is None:
         raise CliError(f"Server not found: {ref}")
     return server
-
-
-def resolve_zone(client: Client, name: str):
-    try:
-        return client.zones.get(name)
-    except Exception as exc:
-        raise CliError(f"Zone not found: {name}", hint=str(exc)) from exc
 
 
 def resolve_volume(client: Client, ref: str):
