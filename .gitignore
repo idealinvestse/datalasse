@@ -59,6 +59,11 @@ STATUS.json
 # These have their own .git repos. Don't nest.
 projects/
 
+# ---------- Greenfield / sandbox workspaces ----------
+# datalasse-gf/ is a separate bootstrap workspace with its own .git
+# (greenfield experiment). Keep the main workspace lean.
+datalasse-gf/
+
 # ---------- Research output snapshots ----------
 # One-shot research outputs (timestamped catalogs, raw scrape dumps).
 # Source for these lives in memory/research/ — keep repo lean.

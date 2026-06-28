@@ -37,6 +37,27 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ---
 
+## Mailcow (e-post för OpenClaw)
+
+- **Admin UI:** https://mail.intelliserve.se (inloggning: `admin` / `moohoo` — byt lösenord direkt)
+- **Domän:** `intelliserve.se`
+- **Agent-mailbox:** `openclaw@intelliserve.se`
+- **Credentials:** `/root/.config/mailcow/openclaw.env` (mode 600)
+- **Himalaya config:** `/root/.config/himalaya/config.toml`
+- **API-nyckel:** `MAILCOW_API_KEY` i `openclaw.json` env.vars
+- **IMAP:** `mail.intelliserve.se:993` (TLS)
+- **SMTP:** `mail.intelliserve.se:587` (STARTTLS)
+- **Skill:** `himalaya` (aktiverad) — list/read/search/compose/send via CLI
+- **Verifiering:** `himalaya folder list` och `himalaya envelope list`
+
+### DNS (krävs för extern leverans)
+
+| Typ | Namn | Värde |
+|-----|------|-------|
+| A | mail.intelliserve.se | 167.233.38.175 |
+| MX | intelliserve.se | mail.intelliserve.se (prio 10) |
+| TXT | intelliserve.se | SPF/DKIM/DMARC — hämta från Mailcow admin → DNS |
+
 ## Grok Build
 
 - Binary: `/root/.grok/bin/grok`
