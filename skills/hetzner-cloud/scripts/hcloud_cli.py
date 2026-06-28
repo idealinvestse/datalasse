@@ -60,6 +60,11 @@ def _add_globals(p: argparse.ArgumentParser) -> None:
 def _parse_record_values(rtype: str, values: list[str]) -> list[ZoneRecord]:
     records = []
     for raw in values:
+        # Hetzner DNS requires TXT record values to be fully wrapped in
+        # double quotes — wrap automatically if not already quoted.
+        if rtype.upper() == "TXT":
+            if not (raw.startswith('"') and raw.endswith('"')):
+                raw = f'"{raw}"'
         records.append(ZoneRecord(value=raw))
     return records
 
@@ -159,14 +164,14 @@ def cmd_record(args: argparse.Namespace) -> None:
         return
 
     if action == "get":
-        if not rname or not rtype:
+        if rname is None or not rtype:
             raise CliError("--name and --type required for record get")
         rrset = client.zones.get_rrset(zone, rname, rtype)
         emit_ok(rrset_to_dict(rrset))
         return
 
     if action in ("create", "set", "add", "remove"):
-        if not rname or not rtype:
+        if rname is None or not rtype:
             raise CliError("--name and --type required")
         if not args.value:
             raise CliError("At least one --value required")

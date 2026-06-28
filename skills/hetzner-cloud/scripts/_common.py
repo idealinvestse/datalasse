@@ -65,8 +65,14 @@ def dry_run_payload(payload: dict[str, Any]) -> None:
 
 
 def normalize_record_name(name: str) -> str:
+    """Normalize a DNS RRSet name for the Hetzner DNS API.
+
+    - "@" and "" both map to the zone apex ("@") — the Hetzner API expects the
+      literal "@" for apex records when creating/modifying RRSets.
+    - Otherwise strip any trailing dot.
+    """
     if name in ("@", ""):
-        return ""
+        return "@"
     return name.rstrip(".")
 
 

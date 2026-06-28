@@ -63,10 +63,24 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ### DNS (krävs för extern leverans)
 
-| Typ | Namn | Värde |
-|-----|------|-------|
-| A | mail.intelliserve.se | 167.233.38.175 |
-| MX | intelliserve.se | mail.intelliserve.se (prio 10) |
+Hanterade via Hetzner DNS (CLI: `skills/hetzner-cloud/bin/hcloud-cli record …`).
+
+| Typ | Namn | Värde | Status |
+|-----|------|-------|--------|
+| A | mail.intelliserve.se | 167.233.38.175 | ✅ |
+| MX | @ | 10 mail.intelliserve.se | ✅ |
+| CNAME | autoconfig | mail.intelliserve.se | ✅ |
+| CNAME | autodiscover | mail.intelliserve.se | ✅ |
+| TXT | @ | `v=spf1 mx a -all` | ✅ (lagt 2026-06-29) |
+| TXT | dkim._domainkey | DKIM pubkey från Mailcow API (multi-string) | ✅ (lagt 2026-06-29) |
+| TXT | _dmarc | `v=DMARC1; p=reject; rua=mailto:postmaster@intelliserve.se; …` | ✅ (lagt 2026-06-29) |
+| PTR | 167.233.38.175 | → mail.intelliserve.se | ⚠️ **TODO** (Hetzner Cloud Console — separat projekt) |
+
+**Verifiering:** `dig +short @1.1.1.1 {intelliserve.se,_dmarc.intelliserve.se,dkim._domainkey.intelliserve.se} TXT` och `dig +short intelliserve.se MX`.
+
+**rDNS / PTR:** Sätts i Hetzner Cloud Console → Servers → `vps-agent-1` → RDNS → peka `mail.intelliserve.se` på IP `167.233.38.175`. Nuvarande PTR (`static.175.38.233.167.clients.your-server.de.`) ger dålig spam-score. **HCLOUD_TOKEN vi har tillgång till tillhör ett separat projekt utan `vps-agent-1`.**
+
+**Backup:** Zon exporterad till `/tmp/intelliserve.se.zone.bak.YYYYMMDD-HHMMSS` innan ändringar.
 | TXT | intelliserve.se | SPF/DKIM/DMARC — hämta från Mailcow admin → DNS |
 
 ## Hetzner Cloud (`hetzner-cloud` skill)
