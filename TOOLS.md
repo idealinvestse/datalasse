@@ -37,6 +37,17 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 
 ---
 
+## Intelliserve LLM Gateway
+
+- **Dashboard:** https://api.intelliserve.se/dashboard
+- **API:** https://api.intelliserve.se/v1 (OpenAI-compatible)
+- **Docs:** https://api.intelliserve.se/docs
+- **Repo:** `idealinvestse/oscar-llm-smart-router`
+- **Install:** `curl -sSL https://raw.githubusercontent.com/idealinvestse/oscar-llm-smart-router/main/scripts/install-intelliserve-vps.sh | sudo bash`
+- **Profiles:** `cheapest`, `fastest`, `high-security`, `coding`, `research`, `agentic`
+- **Headers:** `X-Intelliserve-Profile`, `X-Intelliserve-Session`
+- **OpenClaw:** se `oscar-llm-smart-router/docs/openclaw-integration.md`
+
 ## Mailcow (e-post för OpenClaw)
 
 - **Admin UI:** https://mail.intelliserve.se (inloggning: `admin` / `moohoo` — byt lösenord direkt)
@@ -57,6 +68,16 @@ Skills are shared. Your setup is yours. Keeping them apart means you can update 
 | A | mail.intelliserve.se | 167.233.38.175 |
 | MX | intelliserve.se | mail.intelliserve.se (prio 10) |
 | TXT | intelliserve.se | SPF/DKIM/DMARC — hämta från Mailcow admin → DNS |
+
+## Hetzner Cloud (`hetzner-cloud` skill)
+
+- **CLI:** `skills/hetzner-cloud/bin/hcloud-cli`
+- **Skill:** `hetzner-cloud` (aktiverad) — DNS, servrar, volumes, firewalls, rDNS
+- **Token:** `HCLOUD_TOKEN` permanent lagrad i `~/.config/moss/secrets.env` (mode 600) + speglad i `openclaw.json` → `env.vars` (skapa i Hetzner Cloud Console → Security → API tokens)
+- **Default zone:** `HCLOUD_DEFAULT_ZONE=intelliserve.se`
+- **Setup venv:** `cd skills/hetzner-cloud && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt`
+- **Verifiering:** `skills/hetzner-cloud/bin/hcloud-cli status --json`
+- **Health monitor:** `bin/secrets-validate` (hourly cron) — validerar längd (≥60), regex, och live API-probe mot `/v1/datacenters`
 
 ## Grok Build
 
