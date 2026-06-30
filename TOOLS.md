@@ -212,6 +212,39 @@ git -c "url.https://x-access-token:${GITHUB_TOKEN}@github.com/.insteadOf=https:/
 Also: fine-grained PATs **cannot create new repos via API** (no `Administration: write` scope). Create via UI, then push.
 
 ---
+
+## Skicka Telegram-meddelande till specifik user
+
+Från och med 2026-06-29 har main-agenten `message`-tool (lagts till i `tools.alsoAllow`). Använd för att skicka DM till valfri Telegram-peer som redan är i `channels.telegram.allowFrom`.
+
+**Syntax (från main-session):**
+```
+message(
+  action: "send",
+  channel: "telegram",
+  to: "telegram:8419098743",  # peer-id
+  text: "Hej Paulina! 🌿 Det här är Moss — Oscar bad mig..."
+)
+```
+
+**Vem kan nås:** Bara personer i `channels.telegram.allowFrom` (för närvarande `438805461` Alabama + `8419098743` Paulina).
+
+**Routing-konsekvens:** Meddelandet skickas via `datalasse_bot` (samma bot-konto som svarar i deras DM). Paulina ser det som "Moss/Datalasse" — klart språk som "Moss säger till Paulina: ..." rekommenderas.
+
+**Backup-konfig:** `openclaw.json.bak.pre-main-message-tool-20260629-170855` (innan `message` lades till i `main.tools.alsoAllow`).
+
+### Mönster: relay till Paulina
+
+När Oscar ber dig "skicka X till Paulina":
+
+1. **Klart språk** — "Skickar till Paulina nu 🌿" så han ser att det hände
+2. **Använd `message`-tool** med `to: "telegram:8419098743"`
+3. **Formulera mänskligt** — "Hej Paulina! Det är Oscar via mig 🌿 ..." eller vad kontexten kräver
+4. **Bekräfta till Oscar** — "Skickat ✅"
+
+Skicka ALDRIG något till Paulina utan att Oscar bett om det (respektera hennes integritet).
+
+---
 ## Related
 
 - [Agent workspace](/concepts/agent-workspace)

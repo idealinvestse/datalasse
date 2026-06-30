@@ -252,3 +252,34 @@ Moss's internal tasks (cron jobs, subagent dispatches, grok-build planning) rout
 ## Related
 
 - [Default AGENTS.md](/reference/AGENTS.default)
+
+---
+
+## 📅 Inline button callbacks (calendar)
+
+När en Telegram-knapp skickas till Moss (Oscar), kan `callback_data` börja med `cal:`. Hantera så här:
+
+| Callback | Action |
+|---|---|
+| `cal:ack:<uid_short>` | Markera event som bekräftat. Läs `calendar-reminders.json`, sätt `acked=true`. Bekräfta till Oscar med kort svar. |
+| `cal:snooze:<uid_short>:<duration>` | Skjut upp reminder. `duration` är `15m`, `1h`, `tomorrow`, etc. Läs state, öka snooze_count, registrera ny cron-rad via `register-reminder` scriptet med ny tid. Bekräfta. |
+| `cal:edit:<uid_short>` | "Vad vill du ändra?" — invänta NL-instruction, kalla `cal.agent.update_event`. |
+| `cal:cancel:<uid_short>` | Bekräfta med knapp-rad, kalla `cal.agent.delete_event`. |
+
+**Viktigt:** Max 5 snoozes per event. Efter 5: "Snoozes slut — bekräfta eller flytta?".
+
+Implementation: callback_data kommer in som user-message med prefix. Tolka prefix, kalla motsvarande funktion från `cal.agent` eller `cal.reminders`.
+
+**Implementation (Moss-specifik):**
+
+```python
+# När callback_data "cal:..." kommer in via Telegram
+from cal.callbacks import handle_calendar_callback
+response = handle_calendar_callback(callback_data, agent="main", chat_id="438805461")
+# Svara med response-text och eventuella följd-knappar
+```
+
+Snooze-logik:
+- Första snooze = standard
+- Efter 5 snoozes: tvinga användaren att bekräfta eller flytta
+- Spara snooze_count i `calendar-reminders.json` per UID

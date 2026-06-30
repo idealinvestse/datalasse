@@ -912,13 +912,13 @@ jobs:
 |-------|------|-------|
 | V25 (denna vecka) | Detta dokument klart | Moss |
 | V26-27 (jun-jul) | Sommarpaus, förbered infrastruktur | Moss |
-| V28 (v 7/7) | Kontakta Borlänge + påbörja BankID-process | Moss + Osca |
+| V28 (v 7/7) | Kontakta Borlänge + påbörja BankID-process | Moss + Oscar |
 | V29-30 (jul-aug) | Bygg wizard, datamodell, Lantmäteriet-integration | Moss |
-| V31 (aug) | Kontakta Borlänge IT-chef (efter sommaruppehåll) | Osca |
+| V31 (aug) | Kontakta Borlänge IT-chef (efter sommaruppehåll) | Oscar |
 | V32-34 (aug-sep) | Bygg dokumentuppladdning, fullmakt, inlämning | Moss |
-| V35 (v 23/9) | Demo Öppet hus Palladium, MVP redo för pilot | Osca |
-| V36-39 (sep-okt) | Pilot med 10-20 användare, iterera | Osca + Moss |
-| V40+ (okt) | Utvärdera pilot, planera expansion | Osca |
+| V35 (v 23/9) | Demo Öppet hus Palladium, MVP redo för pilot | Oscar |
+| V36-39 (sep-okt) | Pilot med 10-20 användare, iterera | Oscar + Moss |
+| V40+ (okt) | Utvärdera pilot, planera expansion | Oscar |
 
 ---
 
