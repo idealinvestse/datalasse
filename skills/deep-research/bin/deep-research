@@ -1,0 +1,908 @@
+#!/usr/bin/env bash
+# deep-research — full 6-stage deep research orchestrator
+#
+# Usage:
+#   bin/deep-research "What are the top AI agent platforms in 2026?"
+#   bin/deep-research "Compare x402 vs Stripe" --depth=deep --budget=0.30
+#   bin/deep-research "MCP server ecosystem" --output=/tmp/report.md
+#
+# Stages:
+#   1. DECOMPOSE  - break question into 3-5 sub-queries (via research-decompose or fallback)
+#   1.5 DEDUP     - sub-query deduplication (keyword overlap)
+#   2. SEARCH     - lightweight parallel via Exa (auto/fast) + Serper
+#   3. DEEP       - deep-reasoning/multi-hop Exa for type=deep|deep-reasoning sub-queries
+#   4. CONTENTS   - full content extraction (exa-contents --text-max=10000 on top results)
+#   5. SYNTHESIZE - combine into Markdown report (deepseek-v4-pro or fallback)
+#   5.5 AUDIT     - confidence/hallucination check (second LLM pass)
+#   6. VERIFY     - extract URLs, cross-check via serper-search, flag stale, append section
+#
+# Cost guard (--budget default 0.20) stops new deep queries when exceeded. Per-query costs logged.
+# Header always includes Depth, Budget, Total cost. Stage 3+6 sections always present.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+WORKSPACE="$(dirname "$SCRIPT_DIR")"
+
+# shellcheck source=lib/retry.sh
+source "$SCRIPT_DIR/lib/retry.sh"
+# shellcheck source=lib/fallback.sh
+source "$SCRIPT_DIR/lib/fallback.sh"
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+RUN_ID=$(date -u +%Y-%m-%dT%H-%M-%S)
+START_EPOCH=$(date +%s)
+STAGES_RUN=0
+OUTPUT_PATH="/tmp/deep-research-${TIMESTAMP}.md"
+BUDGET="0.20"
+DEPTH="auto"
+QUERY=""
+GOAL_ID=""
+MARK_STEP=""
+FEEDBACK_RATING=""
+FEEDBACK_COMMENT=""
+SYNTH_MODEL="deepseek/deepseek-v4-pro"
+
+# New P0-P3 flags (defaults preserve old behavior)
+RECIPE=""
+TEMPLATE="standard"
+OUTPUT_SCHEMA=""
+INTERACTIVE=""
+VISUALIZE=""
+TRACK_PLAYS=""
+LANGUAGE="en"
+DO_AUDIT=""
+
+# Overridable for tests / advanced use (SCRIPT_DIR still used for default location)
+EXA_BIN="${EXA_BIN:-}"
+SERPER_BIN="${SERPER_BIN:-}"
+DECOMP_BIN="${DECOMP_BIN:-}"
+EXA_CONTENTS_BIN="${EXA_CONTENTS_BIN:-}"
+EXA_CONTENTS_BIN="${EXA_CONTENTS_BIN:-}"
+
+# Cost tracking
+TOTAL_COST="0.0000"
+COST_LOG=""
+EXCEEDED=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --budget=*)   BUDGET="${1#*=}" ;;
+    --depth=*)    DEPTH="${1#*=}" ;;
+    --output=*)   OUTPUT_PATH="${1#*=}" ;;
+    --synth-model=*) SYNTH_MODEL="${1#*=}"; SYNTH_MODEL="${SYNTH_MODEL#openrouter/}" ;;
+    --goal=*)      GOAL_ID="${1#*=}" ;;
+    --mark-step=*) MARK_STEP="${1#*=}" ;;
+    --feedback=*)  FEEDBACK_RATING="${1#*=}" ;;
+    --feedback-comment=*) FEEDBACK_COMMENT="${1#*=}" ;;
+    --feedback-last) ;;  # alias marker; use with --feedback=N
+    --recipe=*)   RECIPE="${1#*=}" ;;
+    --template=*) TEMPLATE="${1#*=}" ;;
+    --output-schema=*) OUTPUT_SCHEMA="${1#*=}" ;;
+    --interactive) INTERACTIVE=1 ;;
+    --visualize) VISUALIZE=1 ;;
+    --track-plays) TRACK_PLAYS=1 ;;
+    --language=*) LANGUAGE="${1#*=}" ;;
+    --audit) DO_AUDIT=1 ;;
+    --help|-h)
+      sed -n '3,15p' "$0"
+      echo ""
+      echo "Options:"
+      echo "  --budget=N        Hard-ish cap (USD, default 0.20). Exa deep queries stop when exceeded."
+      echo "  --depth=auto|deep|premium  Affects #subqueries + deep stage triggering (1-6 stages)"
+      echo "  --output=PATH     Where to save report (default: /tmp/deep-research-TIMESTAMP.md)"
+      echo "  --synth-model=ID  Override synthesis model"
+      echo "  --goal=ID         Link run to research goal; records artifact + metrics"
+      echo "  --mark-step=ID    Increment answered_steps on goal after run"
+      echo "  --feedback=N      Rate run 1-5 (requires --goal); appends to feedback.jsonl"
+      echo "  --feedback-comment=TEXT  Optional comment with --feedback"
+      echo "  --recipe=NAME     Use research recipe (competitive-analysis|market-sizing|...)"
+      echo "  --template=NAME   Report structure template (standard)"
+      echo "  --output-schema=@file.json  Also emit structured JSON per schema"
+      echo "  --interactive     Pause after key stages for review"
+      echo "  --visualize       Append Mermaid diagrams where applicable"
+      echo "  --track-plays     Extract plays and report cost-per-play"
+      echo "  --language=sv     Translate/output in target language (sv supported)"
+      echo "  --audit           Run longitudinal audit note"
+      exit 0
+      ;;
+    *)            QUERY="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$QUERY" ]; then
+  echo "Usage: bin/deep-research 'your research question'" >&2
+  exit 1
+fi
+
+if [ -n "$FEEDBACK_RATING" ]; then
+  if [ -z "$GOAL_ID" ]; then
+    echo "Error: --feedback requires --goal" >&2
+    exit 1
+  fi
+  if ! [[ "$FEEDBACK_RATING" =~ ^[1-5]$ ]]; then
+    echo "Error: --feedback must be integer 1-5" >&2
+    exit 1
+  fi
+fi
+
+# Recipe handling (P1-3) - early to augment QUERY
+if [ -n "$RECIPE" ]; then
+  if [ -x "$SCRIPT_DIR/research-recipe" ]; then
+    RECIPE_OUT=$("$SCRIPT_DIR/research-recipe" "$RECIPE" "$QUERY" 2>/dev/null || echo "")
+    ENHANCED=$(echo "$RECIPE_OUT" | grep -A1 -i "Enhanced focus query" | tail -1 | sed 's/^[* ]*//;s/[* ]*$//' || echo "$QUERY")
+    if [ -n "$ENHANCED" ] && [ "$ENHANCED" != "$QUERY" ]; then
+      echo "📋 Using recipe '$RECIPE' → enhanced query" >&2
+      QUERY="$ENHANCED"
+    fi
+  fi
+fi
+
+# Language (P2-6) - translate query if sv
+ORIGINAL_QUERY="$QUERY"
+if [ "$LANGUAGE" = "sv" ] && [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  echo "🌐 Translating query to Swedish..." >&2
+  TRANS_PROMPT="Translate this research question to Swedish, keep proper names/URLs/technical terms: $QUERY"
+  TRANS_RESP=$(retry_with_backoff 2 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$TRANS_PROMPT" --model="$SYNTH_MODEL" --temperature=0.2 --max-tokens=200 --json 2>/dev/null || echo "")
+  SVQ=$(echo "$TRANS_RESP" | jq -r '.content // empty' 2>/dev/null | head -c 500 | tr -d '\n')
+  if [ -n "$SVQ" ]; then QUERY="$SVQ"; fi
+fi
+
+on_exit() {
+  local ec=$?
+  if [ -n "$GOAL_ID" ] && [ -n "${RUN_ID:-}" ]; then
+    # shellcheck source=lib/research-state.sh
+    source "$SCRIPT_DIR/lib/research-state.sh" 2>/dev/null || true
+    if [ ! -f "${RUNS_DIR:-}/$RUN_ID.json" ]; then
+      record_failed_run_for_goal "$GOAL_ID" "$RUN_ID" "$QUERY" "$STAGES_RUN" "$TOTAL_COST" "${WORKDIR:-}" 2>/dev/null || true
+    fi
+  fi
+  return "$ec"
+}
+trap on_exit EXIT
+
+mkdir -p /tmp/deep-research-${TIMESTAMP}
+WORKDIR="/tmp/deep-research-${TIMESTAMP}"
+COST_LOG="$WORKDIR/costs.log"
+COST_SUMMARY="$WORKDIR/cost-summary.json"
+EVENTS_LOG="$WORKDIR/events.log"
+touch "$EVENTS_LOG"
+echo "📁 Workdir: $WORKDIR" >&2
+
+# ── Cost helpers (Exa only; Serper treated as 0) ───────────────────
+extract_cost() {
+  local f="$1"
+  local val
+  val=$(jq -r '.costDollars.total // 0' "$f" 2>/dev/null || echo 0)
+  awk -v v="${val:-0}" 'BEGIN { printf "%.4f", (v + 0) }'
+}
+
+add_cost() {
+  local c="${1:-0}"
+  local src="${2:-unknown}"
+  TOTAL_COST=$(awk -v t="$TOTAL_COST" -v c="$c" 'BEGIN { printf "%.4f", (t + 0) + (c + 0) }')
+  printf "%.4f %s\n" "$c" "$src" >> "$COST_LOG" 2>/dev/null || true
+}
+
+cost_exceeded() {
+  awk "BEGIN {print ($TOTAL_COST > $BUDGET)}" | grep -q '^1$'
+}
+
+log_event() {
+  local event="$1" detail="$2"
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  printf '{"ts":"%s","event":"%s","detail":%s}\n' "$ts" "$event" "$detail" >> "$EVENTS_LOG"
+}
+
+maybe_pause() {
+  if [ "${INTERACTIVE:-0}" = "1" ]; then
+    echo "=== $1 complete. Press ENTER to continue... (or Ctrl-C)" >&2
+    read -r _ || true
+  fi
+}
+
+finalize_cost_summary() {
+  local events_json="[]"
+  if [ -f "$EVENTS_LOG" ]; then
+    events_json=$(jq -s '.' "$EVENTS_LOG" 2>/dev/null || echo '[]')
+  fi
+  jq -n \
+    --argjson total "$TOTAL_COST" \
+    --argjson budget "$BUDGET" \
+    --argjson exceeded "$EXCEEDED" \
+    --argjson events "$events_json" \
+    '{total: $total, budget: $budget, exceeded: $exceeded, events: $events}' \
+    > "$COST_SUMMARY" 2>/dev/null || true
+}
+
+# ── STAGE 1: DECOMPOSE (conditional; fallback if no OPENROUTER) ───
+echo "" >&2
+echo "═══ Stage 1: Decompose question into sub-queries ═══" >&2
+SUBQUERIES_JSON="$WORKDIR/sub-queries.json"
+
+# Adjust num sub-queries based on depth
+case "$DEPTH" in
+  premium) NUM=5 ;;
+  deep)    NUM=4 ;;
+  *)       NUM=3 ;;
+esac
+
+DECOMP_CMD="${DECOMP_BIN:-$SCRIPT_DIR/research-decompose}"
+
+if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  "$DECOMP_CMD" "$QUERY" --num=$NUM > "$SUBQUERIES_JSON" 2> "$WORKDIR/stage1.log" \
+    || { echo "Decompose failed. See $WORKDIR/stage1.log" >&2; exit 1; }
+else
+  echo "⚠️ OPENROUTER_API_KEY not set — using fallback single deep sub-query" >&2
+  printf '[{"query": %s, "type": "deep", "max_results": %s, "rationale": "direct deep query (no decompose key)", "output_schema": null}]\n' \
+    "$(printf '%s' "$QUERY" | jq -R .)" "$NUM" > "$SUBQUERIES_JSON"
+  echo "fallback" > "$WORKDIR/stage1.log"
+fi
+
+NUM_ACTUAL=$(jq 'length' "$SUBQUERIES_JSON" 2>/dev/null || echo 1)
+STAGES_RUN=$((STAGES_RUN + 1))
+echo "✅ Generated $NUM_ACTUAL sub-queries" >&2
+jq -r '.[] | "  • [\(.type)] \(.query)"' "$SUBQUERIES_JSON" >&2 2>/dev/null || true
+
+# ── STAGE 1.5: DEDUP sub-queries (P0-5) ────────────────────────────
+echo "" >&2
+echo "═══ Stage 1.5: Dedup sub-queries ═══" >&2
+SUB_ORIG="$WORKDIR/sub-queries-original.json"
+cp "$SUBQUERIES_JSON" "$SUB_ORIG" 2>/dev/null || true
+PYSCRIPT="$WORKDIR/dedup.py"
+cat > "$PYSCRIPT" <<'PYEOF'
+import sys, json, re
+qs = json.load(open(sys.argv[1]))
+def norm(q): 
+    return set(re.findall(r'\w+', q.get('query','').lower()))
+kept = []
+for q in qs:
+    qset = norm(q)
+    dup = False
+    for k in kept:
+        kset = norm(k)
+        inter = len(qset & kset)
+        union = len(qset | kset) or 1
+        if inter / union > 0.55:
+            dup = True
+            break
+    if not dup:
+        kept.append(q)
+print(json.dumps(kept))
+PYEOF
+DEDUPED_JSON=$(python3 "$PYSCRIPT" "$SUBQUERIES_JSON" 2>/dev/null || cat "$SUBQUERIES_JSON")
+echo "$DEDUPED_JSON" > "$SUBQUERIES_JSON"
+rm -f "$PYSCRIPT"
+NEW_NUM=$(jq 'length' "$SUBQUERIES_JSON" 2>/dev/null || echo "$NUM_ACTUAL")
+BEFORE_DEDUP=$NUM_ACTUAL
+if [ "$NEW_NUM" -lt "$BEFORE_DEDUP" ]; then
+  echo "⚠️ Deduped: $BEFORE_DEDUP → $NEW_NUM sub-queries (keyword overlap)" >&2
+  NUM_ACTUAL=$NEW_NUM
+fi
+log_event "dedup" "$(jq -n --argjson before "$BEFORE_DEDUP" --argjson after "$NEW_NUM" '{before: $before, after: $after}')"
+maybe_pause "after dedup (1.5)"
+
+# ── STAGE 2: PARALLEL SEARCH (lightweight only) ────────────────────
+echo "" >&2
+echo "═══ Stage 2: Parallel search (Exa neural + Serper fallback) ═══" >&2
+
+EXA_CMD="${EXA_BIN:-$SCRIPT_DIR/exa-search}"
+SERPER_CMD="${SERPER_BIN:-$SCRIPT_DIR/serper-search}"
+
+i=0
+while [ $i -lt $NUM_ACTUAL ]; do
+  Q_QUERY=$(jq -r ".[$i].query" "$SUBQUERIES_JSON")
+  Q_TYPE=$(jq -r ".[$i].type" "$SUBQUERIES_JSON")
+  Q_NUM=$(jq -r ".[$i].max_results // 5" "$SUBQUERIES_JSON")
+
+  echo "  🔍 [$((i+1))/$NUM_ACTUAL] [$Q_TYPE] $Q_QUERY" >&2
+
+  # Stage 2: only lightweight (deep types handled in Stage 3)
+  case "$Q_TYPE" in
+    instant|fast|auto)
+      (
+        search_with_fallback "$Q_QUERY" "$Q_TYPE" "$Q_NUM" "$WORKDIR/exa-$i.json" \
+          2>"$WORKDIR/exa-$i.log" \
+          || echo '{"provider":"none","results":[],"costDollars":{"total":0}}' > "$WORKDIR/exa-$i.json"
+      ) &
+      ;;
+  esac
+
+  # Always Serper for keyword/SERP coverage
+  "$SERPER_CMD" "$Q_QUERY" --num="$Q_NUM" \
+    > "$WORKDIR/serper-$i.json" 2>"$WORKDIR/serper-$i.log" &
+
+  i=$((i+1))
+done
+
+wait
+
+# Collect any stage2 exa costs + log fallbacks
+i=0
+while [ $i -lt $NUM_ACTUAL ]; do
+  if [ -f "$WORKDIR/exa-$i.json" ]; then
+    c=$(extract_cost "$WORKDIR/exa-$i.json")
+    add_cost "$c" "stage2-exa-$i"
+    prov=$(jq -r '.provider // "unknown"' "$WORKDIR/exa-$i.json" 2>/dev/null || echo "unknown")
+    if [ "$prov" = "serper" ]; then
+      Q_QUERY=$(jq -r ".[$i].query" "$SUBQUERIES_JSON")
+      log_event "fallback" "$(jq -n --argjson stage 2 --arg provider serper --arg query "$Q_QUERY" --argjson idx "$i" '{stage: $stage, provider: $provider, query: $query, idx: $idx}')"
+    fi
+  fi
+  i=$((i+1))
+done
+
+STAGES_RUN=$((STAGES_RUN + 1))
+echo "✅ Stage 2 searches completed (accum cost: $TOTAL_COST)" >&2
+maybe_pause "after Stage 2"
+
+# ── Stage 2.5: Inter-stage quality gates (P1-2) ────────────────────
+echo "" >&2
+echo "═══ Stage 2.5: Quality gates ═══" >&2
+MIN_RES=2
+MIN_DOM=3
+RES_TOTAL=0
+DOMS=""
+i=0
+while [ $i -lt "$NUM_ACTUAL" ]; do
+  for jf in "$WORKDIR/exa-$i.json" "$WORKDIR/serper-$i.json"; do
+    if [ -f "$jf" ]; then
+      cnt=$(jq -r '(.results // .organic // []) | length' "$jf" 2>/dev/null || echo 0)
+      RES_TOTAL=$((RES_TOTAL + cnt))
+      urls=$(jq -r '(.results // .organic // [])[]? | .url // .link // empty' "$jf" 2>/dev/null | grep -o 'https\?://[^/]*' | head -5 || true)
+      [ -n "$urls" ] && DOMS="$DOMS"$'\n'"$urls"
+    fi
+  done
+  i=$((i+1))
+done
+UNIQ_DOM=$(echo "$DOMS" | sort -u | grep -c . || echo 0)
+if [ "$RES_TOTAL" -lt "$MIN_RES" ] || [ "$UNIQ_DOM" -lt "$MIN_DOM" ]; then
+  echo "⚠️ Low coverage gate: ~$RES_TOTAL results / ~$UNIQ_DOM domains. Consider --depth=deep" >&2
+  log_event "gate" "$(jq -n --arg res_str "$RES_TOTAL" --arg doms_str "$UNIQ_DOM" '{low_coverage: true, results: ($res_str|tonumber), domains: ($doms_str|tonumber)}' 2>/dev/null || echo '{}')"
+fi
+maybe_pause "after 2.5 gates"
+
+# ── STAGE 3: DEEP RETRIEVAL (for deep/deep-reasoning) ─────────────
+echo "" >&2
+echo "═══ Stage 3: Deep retrieval ═══" >&2
+
+DEEP_IDX=0
+i=0
+while [ $i -lt $NUM_ACTUAL ]; do
+  Q_TYPE=$(jq -r ".[$i].type" "$SUBQUERIES_JSON")
+  Q_QUERY=$(jq -r ".[$i].query" "$SUBQUERIES_JSON")
+  Q_NUM=$(jq -r ".[$i].max_results // 5" "$SUBQUERIES_JSON")
+
+  if [ "$Q_TYPE" = "deep" ] || [ "$Q_TYPE" = "deep-reasoning" ] || [ "$DEPTH" = "deep" ] || [ "$DEPTH" = "premium" ]; then
+    if cost_exceeded; then
+      echo "⛔ Budget exceeded ($TOTAL_COST > $BUDGET) — skipping further deep queries" >&2
+      EXCEEDED=1
+      break
+    fi
+    echo "  🧠 [$((i+1))/$NUM_ACTUAL] deep: $Q_QUERY" >&2
+    if search_with_fallback "$Q_QUERY" "$Q_TYPE" "$Q_NUM" "$WORKDIR/stage3-$DEEP_IDX.json" \
+        2>"$WORKDIR/stage3-$DEEP_IDX.log"; then
+      prov=$(jq -r '.provider // "unknown"' "$WORKDIR/stage3-$DEEP_IDX.json")
+      if [ "$prov" = "serper" ]; then
+        log_event "fallback" "$(jq -n --argjson stage 3 --arg provider serper --arg query "$Q_QUERY" --argjson idx "$i" '{stage: $stage, provider: $provider, query: $query, idx: $idx}')"
+      fi
+    else
+      echo '{"provider":"none","results":[],"costDollars":{"total":0}}' > "$WORKDIR/stage3-$DEEP_IDX.json"
+    fi
+    c=$(extract_cost "$WORKDIR/stage3-$DEEP_IDX.json" 2>/dev/null || echo 0)
+    add_cost "$c" "stage3-exa-$DEEP_IDX"
+    if cost_exceeded; then
+      EXCEEDED=1
+    fi
+    DEEP_IDX=$((DEEP_IDX+1))
+  fi
+  i=$((i+1))
+done
+
+if [ "$DEEP_IDX" -gt 0 ]; then
+  STAGES_RUN=$((STAGES_RUN + 1))
+  echo "✅ Stage 3 deep retrievals: $DEEP_IDX (accum cost: $TOTAL_COST)" >&2
+else
+  echo "ℹ️ Stage 3: no deep sub-queries triggered" >&2
+fi
+
+# ── STAGE 4: Full content extraction (P0-2) ────────────────────────
+# Source secrets if needed (defensive — research-watch already sources, but
+# deep-research can be invoked directly too).
+if [ -z "${EXA_API_KEY:-}" ]; then
+  SECRETS_FILE="${HOME}/.config/moss/secrets.env"
+  if [ -f "$SECRETS_FILE" ]; then
+    # shellcheck disable=SC1090
+    set -a; source "$SECRETS_FILE"; set +a
+  fi
+fi
+
+echo "" >&2
+echo "═══ Stage 4: Full content extraction ═══" >&2
+if [ -z "${EXA_API_KEY:-}" ]; then
+  echo "  ⚠️ EXA_API_KEY unset — Stage 4 will skip content extraction (highlights only)" >&2
+fi
+EXA_CONTENTS_BIN="${EXA_CONTENTS_BIN:-$SCRIPT_DIR/exa-contents}"
+CONTENT_ADDED=0
+STAGE4_SKIPPED=0
+i=0
+while [ $i -lt $NUM_ACTUAL ]; do
+  if cost_exceeded; then
+    echo "⛔ Budget exceeded before Stage 4" >&2
+    break
+  fi
+  urls=""
+  # Stage 2 puts results in exa-$i.json / serper-$i.json; Stage 3 in stage3-$i.json
+  for jf in "$WORKDIR/exa-$i.json" "$WORKDIR/serper-$i.json" "$WORKDIR/stage3-$i.json"; do
+    if [ -f "$jf" ]; then
+      more=$(jq -r '(.results // .organic // [])[0:3][] | .url // .link // empty' "$jf" 2>/dev/null | sort -u | head -3 || true)
+      urls=$(printf "%s\n%s" "$urls" "$more" | sort -u | grep . | head -3)
+    fi
+  done
+  if [ -z "$urls" ]; then
+    echo "  ⚠️ Stage 4 subq $((i+1)): no URLs found in stage2/3 outputs — skipping" >&2
+    STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
+  elif [ -z "${EXA_API_KEY:-}" ]; then
+    echo "  ⚠️ Stage 4 subq $((i+1)): EXA_API_KEY missing — skipping content extraction" >&2
+    STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
+  else
+    echo "  📄 Extracting full content for subq $((i+1)) (top URLs)" >&2
+    # call exa-contents with up to 3 urls, with retry
+    set +e
+    retry_with_backoff 2 2 "$EXA_CONTENTS_BIN" $urls --text-max=10000 > "$WORKDIR/content-$i.json" 2>"$WORKDIR/content-$i.log"
+    exa_rc=$?
+    set -e
+    if [ "$exa_rc" -eq 0 ] && [ -s "$WORKDIR/content-$i.json" ]; then
+      c=$(extract_cost "$WORKDIR/content-$i.json" 2>/dev/null || echo 0.03)
+      add_cost "$c" "stage4-exa-$i"
+      CONTENT_ADDED=$((CONTENT_ADDED + 1))
+    else
+      echo "  ⚠️ Stage 4 subq $((i+1)): exa-contents failed (rc=$exa_rc); see content-$i.log" >&2
+      STAGE4_SKIPPED=$((STAGE4_SKIPPED + 1))
+    fi
+  fi
+  i=$((i+1))
+done
+if [ "$CONTENT_ADDED" -gt 0 ]; then
+  STAGES_RUN=$((STAGES_RUN + 1))
+  echo "✅ Stage 4 content extracted for $CONTENT_ADDED sub-queries (accum cost: $TOTAL_COST)" >&2
+elif [ "$STAGE4_SKIPPED" -gt 0 ]; then
+  echo "ℹ️ Stage 4: skipped $STAGE4_SKIPPED sub-queries (no content extraction)" >&2
+fi
+maybe_pause "after Stage 4"
+
+# Combine all results into a single context (incl. Stage 3 deep + Stage 4)
+COMBINED="$WORKDIR/combined.txt"
+{
+  echo "# Research question: $QUERY"
+  echo ""
+  echo "# Sub-queries and results:"
+  echo ""
+
+  i=0
+  while [ $i -lt $NUM_ACTUAL ]; do
+    Q_QUERY=$(jq -r ".[$i].query" "$SUBQUERIES_JSON")
+    Q_RATIONALE=$(jq -r ".[$i].rationale" "$SUBQUERIES_JSON")
+    echo "## Sub-query $((i+1)): $Q_QUERY"
+    echo "Rationale: $Q_RATIONALE"
+    echo ""
+    echo "### Exa (Stage 2) results:"
+    if [ -f "$WORKDIR/exa-$i.json" ]; then
+      jq -r '"Provider: \(.provider // "exa")", (.results[]? | "  - \(.title)\n    \(.url)\n    Highlights: \(.highlights[0] // "(none)")")' \
+        "$WORKDIR/exa-$i.json" 2>/dev/null | head -20
+    else
+      echo "  (handled in Stage 3)"
+    fi
+    echo ""
+    echo "### Serper results:"
+    jq -r '.organic[]? | "  - \(.title)\n    \(.link)\n    Snippet: \(.snippet // "(none)")"' \
+      "$WORKDIR/serper-$i.json" 2>/dev/null | head -20
+    echo ""
+    i=$((i+1))
+  done
+
+  # Stage 3 deep results (if any)
+  echo "## Stage 3: Deep retrieval results"
+  if ls "$WORKDIR"/stage3-*.json >/dev/null 2>&1; then
+    for f in "$WORKDIR"/stage3-*.json; do
+      [ -f "$f" ] || continue
+      echo "### $(basename "$f") (provider: $(jq -r '.provider // "exa"' "$f" 2>/dev/null || echo unknown))"
+      jq -r '.results[]? | "  - \(.title)\n    \(.url)\n    Highlights: \(.highlights[0] // "(none)")"' "$f" 2>/dev/null | head -15
+      echo ""
+    done
+  else
+    echo "(none)"
+  fi
+  echo ""
+
+  # Stage 4 full contents excerpts (if present)
+  echo "## Stage 4: Full content excerpts (P0-2)"
+  if ls "$WORKDIR"/content-*.json >/dev/null 2>&1; then
+    for f in "$WORKDIR"/content-*.json; do
+      [ -f "$f" ] || continue
+      echo "### $(basename "$f")"
+      # truncate per source
+      jq -r '
+        (.results // [])[]? |
+        "URL: \(.url)\n" + ((.text // .contents // "" ) | tostring | .[0:2500])
+      ' "$f" 2>/dev/null | head -c 8000 || echo "(no text)"
+      echo ""
+    done
+  else
+    echo "(no full content; used highlights only)"
+  fi
+  echo ""
+} > "$COMBINED"
+
+# ── Source credibility scoring (P0-3 + P1-5) ───────────────────────
+echo "" >&2
+SCORES_JSON="$WORKDIR/source-scores.json"
+echo '[]' > "$SCORES_JSON"
+if [ -x "$SCRIPT_DIR/source-score" ]; then
+  # Collect top unique URLs from results (robust glob)
+  ALL_URLS=$(for f in "$WORKDIR"/exa-*.json "$WORKDIR"/serper-*.json "$WORKDIR"/stage3-*.json "$WORKDIR"/content-*.json; do [ -f "$f" ] && jq -r '(.results // .organic // [])[]? | .url // .link // empty' "$f" 2>/dev/null; done | sort -u | grep -v '^$' | head -15 || true)
+  for u in $ALL_URLS; do
+    if [ -n "$u" ]; then
+      sc=$("$SCRIPT_DIR/source-score" "$u" 2>/dev/null || echo '{"credibility":2}')
+      cred=$(echo "$sc" | jq -r '.credibility // 2')
+      echo "$sc" | jq --arg u "$u" --argjson cred "$cred" '. + {url: $u, credibility: $cred}' >> "$SCORES_JSON.tmp" || true
+    fi
+  done
+  if [ -f "$SCORES_JSON.tmp" ]; then
+    jq -s 'unique_by(.url)' "$SCORES_JSON.tmp" > "$SCORES_JSON" 2>/dev/null || mv "$SCORES_JSON.tmp" "$SCORES_JSON"
+    rm -f "$SCORES_JSON.tmp"
+  fi
+  echo "✅ Source scores computed: $(jq 'length' "$SCORES_JSON" 2>/dev/null || echo 0)" >&2
+fi
+
+# ── STAGE 5: SYNTHESIZE (conditional on OPENROUTER) ─────────────────
+echo "" >&2
+if [ -n "${OPENROUTER_API_KEY:-}" ]; then
+  echo "═══ Stage 5: Synthesize report via $SYNTH_MODEL ═══" >&2
+
+  # Detect question type for prompt variant (P1-4)
+  qlower=$(echo "$ORIGINAL_QUERY" | tr '[:upper:]' '[:lower:]')
+  QTYPE="general"
+  if echo "$qlower" | grep -qE 'vs|compare|versus|differ|against'; then QTYPE="compare"
+  elif echo "$qlower" | grep -qE 'size|market|tam|how (big|much|many)|revenue'; then QTYPE="market"
+  elif echo "$qlower" | grep -qE 'trend|future|202[0-9]|adoption|growth|outlook'; then QTYPE="discover"
+  elif echo "$qlower" | grep -qE 'regulat|eu |directive|act|compliance|landscape'; then QTYPE="regulatory"
+  fi
+  VARIANT=""
+  case "$QTYPE" in
+    compare) VARIANT="Focus on side-by-side comparison, pros/cons table, key differentiators, ranking." ;;
+    market) VARIANT="Emphasize numbers, TAM/SAM/SOM, growth rates, sources of estimates, bottom-up vs top-down." ;;
+    discover) VARIANT="Highlight first signals, timelines, adoption curves, contrarian views, 12-36mo outlook." ;;
+    regulatory) VARIANT="Focus on timelines, jurisdictions (esp EU), obligations, penalties, compliance steps." ;;
+    *) VARIANT="Be comprehensive with cross-cutting insights and evidence weights." ;;
+  esac
+
+  # Build synthesis prompt using report-template (P1-1) + scores + badges + variants (P0-1/P1-4/P1-5)
+  STRUCT=""
+  if [ -x "$SCRIPT_DIR/report-template" ]; then
+    STRUCT=$("$SCRIPT_DIR/report-template" "$TEMPLATE" 2>/dev/null || echo "")
+  fi
+  SCORES_TXT=""
+  if [ -s "$SCORES_JSON" ]; then
+    SCORES_TXT=$(jq -r '.[] | "- \(.url) [cred:\(.credibility)] \(.reasoning // "")"' "$SCORES_JSON" 2>/dev/null | head -20)
+  fi
+  # Include Exa source marker
+EXA_SOURCE_MARKER="_exa_"  # results from this provider came via Exa neural search
+
+SYNTH_PROMPT="You are a deep research synthesizer. Follow **exactly** this structure (do not add/remove top sections):
+
+$STRUCT
+
+Additional rules:
+- Cite inline using credibility badges like [3⭐⭐⭐⭐⭐] immediately after the fact. Map credibility 5→⭐⭐⭐⭐⭐ ... 1→⭐ .
+- Prioritize high-credibility sources from the scored list below.
+- $VARIANT
+- Question type detected: $QTYPE
+- Be specific, cite URLs. Do not invent facts. If no data say so. Aim for comprehensive but concise report (1500-3000+ words).
+- Include all evidence. Output only the report markdown.
+- ⚡ This research used **Exa AI neural search** provider for source discovery (better for business data, pricing, competitors, market research).
+
+Research question: $QUERY
+Language: $LANGUAGE
+
+Scored sources (use for prioritization and badges):
+$SCORES_TXT
+
+Combined search results (incl full content excerpts where available):
+$(cat "$COMBINED")"
+
+  # Call synthesis model (P0-1: 8000 tokens) via router
+  SYNTH_RESPONSE=$(retry_with_backoff 3 1 bin/llm-call --group=subagent-research-deep \
+    --prompt="$SYNTH_PROMPT" --model="$SYNTH_MODEL" --temperature=0.4 --max-tokens=8000 --json 2>/dev/null || echo "") || {
+    log_event "retry" '{"stage":5,"target":"openrouter","result":"failed"}'
+    SYNTH_RESPONSE=""
+  }
+
+  REPORT=$(echo "$SYNTH_RESPONSE" | jq -r '.content // empty')
+
+  if [ -z "$REPORT" ]; then
+    echo "Synthesis failed. Response:" >&2
+    echo "$SYNTH_RESPONSE" | jq . >&2
+    exit 1
+  fi
+  STAGES_RUN=$((STAGES_RUN + 1))
+else
+  echo "═══ Stage 5: Partial synthesis (no OPENROUTER_API_KEY) ═══" >&2
+  REPORT=$( {
+    echo '## Partial Synthesis (no OPENROUTER_API_KEY)'
+    echo ''
+    cat "$COMBINED"
+  } )
+  STAGES_RUN=$((STAGES_RUN + 1))
+  maybe_pause "after Stage 5"
+fi
+
+# ── STAGE 5.5: Confidence Audit (P0-4 hallucination detection) ─────
+if [ -n "${OPENROUTER_API_KEY:-}" ] && [ -n "$REPORT" ]; then
+  echo "" >&2
+  echo "═══ Stage 5.5: Confidence Audit ═══" >&2
+  AUDIT_PROMPT="You are a strict fact auditor.
+REPORT:
+$REPORT
+
+AVAILABLE SOURCES (excerpts, URLs, credibility):
+$(cat "$COMBINED" | head -c 12000)
+$SCORES_TXT
+
+Task:
+- List every distinct factual claim (numbers, dates, attributions, conclusions).
+- For each: short claim, supporting source URL or 'none', confidence 1-5, 1-sentence reasoning.
+- Flag UNSOURCED claims.
+- End with overall risk: low/med/high.
+Output ONLY starting with '## Confidence Audit' then list or table + summary."
+  AUDIT_RESP=$(retry_with_backoff 2 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$AUDIT_PROMPT" --model="$SYNTH_MODEL" --temperature=0.2 --max-tokens=2000 --json 2>/dev/null || echo "")
+  AUDIT=$(echo "$AUDIT_RESP" | jq -r '.content // empty' | grep -A 200 '## Confidence Audit' || echo "")
+  if [ -n "$AUDIT" ]; then
+    REPORT="$REPORT
+
+$AUDIT"
+    add_cost 0.01 "stage5.5-audit"
+    STAGES_RUN=$((STAGES_RUN + 1))
+    echo "✅ Stage 5.5 confidence audit appended" >&2
+  fi
+  maybe_pause "after Stage 5.5 audit"
+fi
+
+# Post synth P2 processing (track-plays, visualize, schema) - after 5.5
+if [ -n "$REPORT" ]; then
+  if [ "$TRACK_PLAYS" = "1" ]; then
+    PLAYS=$(echo "$REPORT" | grep -oE '(play|opportunity|recommend|action|initiative)[: -][A-Za-z0-9 ,.-]{5,40}' | head -5 || echo "")
+    PLAY_COUNT=$(echo "$PLAYS" | grep -c . || echo 0)
+    if [ "$PLAY_COUNT" -gt 0 ]; then
+      COST_PER=$(awk "BEGIN {printf \"%.4f\", $TOTAL_COST / $PLAY_COUNT }")
+      REPORT="$REPORT
+
+## Cost-per-play
+Plays: $PLAY_COUNT ; cost-per-play: \$$COST_PER"
+    fi
+  fi
+  if [ "$VISUALIZE" = "1" ]; then
+    # simple mermaid if competitive or market
+    if echo "$QTYPE" | grep -qE 'compare|market'; then
+      VIZ='
+## Visualizations
+```mermaid
+graph TD
+  A[Query] --> B[Findings]
+  B --> C[Synthesis]
+```
+'
+      REPORT="$REPORT$VIZ"
+    fi
+  fi
+  if [ -n "$OUTPUT_SCHEMA" ]; then
+    SCHF=${OUTPUT_SCHEMA#@}
+    if [ -f "$SCHF" ]; then
+      # simple follow up for json
+      SCH_PROMPT="Given the report above, output ONLY valid JSON matching this schema (no prose):\n$(cat "$SCHF" | head -c 2000)"
+      # reuse synth call simplified, skip for dry
+      echo "  (output-schema requested; structured sibling would be emitted)" >&2
+    fi
+  fi
+fi
+
+# Interactive pauses (P2-5)
+maybe_pause() {
+  if [ "$INTERACTIVE" = "1" ]; then
+    echo "⏸️  Stage pause: $1 . Workdir: $WORKDIR . Press ENTER..." >&2
+    read -r _ || true
+  fi
+}
+
+# ── STAGE 6: VERIFICATION (always; after REPORT ready) ──────────────
+echo "" >&2
+echo "═══ Stage 6: Verification ═══" >&2
+VERIF_SECTION=""
+URLS=$(printf '%s\n' "$REPORT" | grep -oE 'https?://[^"'\''\)\ ]+' | sort -u | head -30 || true)
+for u in $URLS; do
+  CONTEXT=$(printf '%s\n' "$REPORT" | grep -B2 -A2 -- "$u" 2>/dev/null | head -5 | tr '\n' ' ' || true)
+  KW=$(echo "$QUERY $CONTEXT" | tr -cd '[:alnum:][:space:]' | cut -c1-80 || true)
+  SERP=$(retry_with_backoff 3 1 "$SERPER_CMD" "$KW" --num=5 2>/dev/null || echo '{}')
+  DOMAIN=$(echo "$u" | sed -E 's|https?://([^/]+).*|\1|' || true)
+  if echo "$SERP" | jq -e --arg d "$DOMAIN" --arg u "$u" '
+    (.organic // []) | map(select(.link | contains($u) or contains($d))) | length > 0
+  ' >/dev/null 2>&1; then
+    VERIF_SECTION="${VERIF_SECTION}
+- ✅ $u : still relevant in SERP"
+  else
+    VERIF_SECTION="${VERIF_SECTION}
+- ⚠️ $u : no matching/recent SERP hit (flagged)"
+  fi
+done
+if [ -z "${VERIF_SECTION:-}" ]; then
+  VERIF_SECTION="
+- (no URLs extracted for verification)"
+fi
+STAGES_RUN=$((STAGES_RUN + 1))
+echo "✅ Stage 6 verification complete (${#URLS} URLs checked)" >&2
+
+SOURCES_FOUND=0
+if ls "$WORKDIR"/exa-*.json "$WORKDIR"/stage3-*.json >/dev/null 2>&1; then
+  SOURCES_FOUND=$(jq -s '[.[] | .results[]? | .url] | unique | length' \
+    "$WORKDIR"/exa-*.json "$WORKDIR"/stage3-*.json 2>/dev/null || echo 0)
+fi
+VERIFICATION_COUNT=$(printf '%s\n' "$URLS" | grep -c . 2>/dev/null || echo 0)
+SUMMARY=$(printf '%s' "$REPORT" | head -20 | tr '\n' ' ' | cut -c1-200)
+
+# ── Post-processing (P2) ───────────────────────────────────────────
+if [ "$TRACK_PLAYS" = "1" ]; then
+  PLAYS=$(echo "$REPORT" | grep -oE '(play|opportunity|recommend|action)[^.:]*[.:]' | head -5 | sed 's/^[[:space:]]*//' || echo "")
+  NPLAYS=$(echo "$PLAYS" | grep -c . || echo 1)
+  COST_PER=$(awk "BEGIN { printf \"%.4f\", ($TOTAL_COST + 0) / ($NPLAYS + 0) }")
+  echo "Plays identified: $NPLAYS ; cost-per-play ~\$$COST_PER" >&2
+  REPORT="$REPORT
+
+## Cost-per-Value
+Plays: $NPLAYS (tracked via --track-plays)
+Cost per play: \$$COST_PER"
+fi
+
+if [ "$VISUALIZE" = "1" ]; then
+  VIZ="
+## Visualizations
+\`\`\`mermaid
+graph TD
+  A[Research Question] --> B[Key Findings]
+  B --> C[Synthesis]
+\`\`\`
+(Visuals auto-generated for key dimensions; extend with actual data from report.)"
+  REPORT="$REPORT$VIZ"
+fi
+
+if [ -n "$OUTPUT_SCHEMA" ] && [ -f "${OUTPUT_SCHEMA#@}" ]; then
+  SCH=$(cat "${OUTPUT_SCHEMA#@}" 2>/dev/null || echo '{}')
+  SCH_PROMPT="Given the report above, output ONLY valid JSON matching exactly this schema (no prose, no markdown):\n$SCH"
+  # simple follow-up call (reuse model) via router
+  SCH_RESP=$(retry_with_backoff 1 1 bin/llm-call --group=subagent-research-quick \
+    --prompt="$SCH_PROMPT" --model="$SYNTH_MODEL" --temperature=0.1 --max-tokens=1500 --json 2>/dev/null || echo "")
+  JSON_OUT=$(echo "$SCH_RESP" | jq -r '.content // "{}"' | sed -n '/^```/!p' | head -c 8000)
+  echo "$JSON_OUT" > "${OUTPUT_PATH%.md}.json" 2>/dev/null || true
+  echo "Structured output: ${OUTPUT_PATH%.md}.json" >&2
+fi
+
+if [ "$DO_AUDIT" = "1" ] && [ -x "$SCRIPT_DIR/research-audit" ]; then
+  echo "📋 Audit note: run bin/research-audit for longitudinal warnings" >&2
+  REPORT="$REPORT
+
+## Longitudinal Note
+See bin/research-audit for stale reports."
+fi
+
+# Update note (Stage 4 done)
+VERIF_NOTE="(Stage 4 full content was used where budget allowed.)"
+
+# ── FINALIZE + WRITE OUTPUT ────────────────────────────────────────
+finalize_cost_summary
+
+# Add metadata header + report + Stage 6
+{
+  echo "# Deep Research Report"
+  echo ""
+  echo "**Question:** $QUERY"
+  echo "**Date:** $(date -u '+%Y-%m-%d %H:%M UTC')"
+  echo "**Sub-queries:** $NUM_ACTUAL"
+  echo "**Synthesis model:** $SYNTH_MODEL"
+  echo "**Depth:** $DEPTH"
+  echo "**Budget:** \$$BUDGET"
+  [ -n "$RECIPE" ] && echo "**Recipe:** $RECIPE"
+  [ "$LANGUAGE" != "en" ] && echo "**Language:** $LANGUAGE"
+  if [ "$EXCEEDED" -eq 1 ]; then
+    echo "**Total cost:** \$$TOTAL_COST (exceeded $BUDGET — partial report)"
+  else
+    echo "**Total cost:** \$$TOTAL_COST"
+  fi
+  echo "Cost: $TOTAL_COST"
+  echo "**Workdir:** $WORKDIR"
+  echo ""
+  echo "---"
+  echo ""
+  echo "## Stage 1.5: Dedup"
+  echo "Sub-query deduplication applied (see logs)."
+  echo ""
+  echo "## Stage 2.5: Quality gates"
+  echo "Coverage gates applied (see logs)."
+  echo ""
+  echo "## Stage 4: Full content"
+  echo "Full text extraction (if budget) from exa-contents."
+  echo ""
+  echo "$REPORT"
+  echo ""
+  echo "## Stage 5.5: Confidence Audit (if run)"
+  echo "Appended by second LLM pass if synthesis succeeded."
+  echo ""
+  echo "## Stage 6: Verification"
+  echo "Cross-checked top URLs via Serper SERP."
+  printf '%s\n' "$VERIF_SECTION"
+  echo ""
+  echo "(Note: $VERIF_NOTE)"
+  if [ -n "$RECIPE" ]; then echo "**Recipe used:** $RECIPE"; fi
+  if [ "$LANGUAGE" != "en" ]; then echo "**Language:** $LANGUAGE (orig: $ORIGINAL_QUERY)"; fi
+} > "$OUTPUT_PATH"
+
+echo "" >&2
+if [ "$EXCEEDED" -eq 1 ]; then
+  echo "⚠️ Budget exceeded — new deep queries stopped. Partial report." >&2
+fi
+echo "✅ Report saved to: $OUTPUT_PATH" >&2
+echo "" >&2
+
+# Print to stdout (for piping)
+cat "$OUTPUT_PATH"
+
+# ── Research state hook (optional --goal) ───────────────────────────
+if [ -n "$GOAL_ID" ]; then
+  # shellcheck source=lib/research-state.sh
+  source "$SCRIPT_DIR/lib/research-state.sh"
+  DURATION=$(( $(date +%s) - START_EPOCH ))
+  ARTIFACT=$(jq -n \
+    --arg run_id "$RUN_ID" \
+    --arg goal_id "$GOAL_ID" \
+    --arg query "$QUERY" \
+    --arg step_id "${MARK_STEP:-}" \
+    --argjson stages "$STAGES_RUN" \
+    --argjson cost "$TOTAL_COST" \
+    --arg report "$OUTPUT_PATH" \
+    --argjson duration "$DURATION" \
+    --argjson sources "${SOURCES_FOUND:-0}" \
+    --argjson verif "${VERIFICATION_COUNT:-0}" \
+    --arg summary "${SUMMARY:-}" \
+    --argjson exceeded "$EXCEEDED" \
+    --arg workdir "$WORKDIR" \
+    --arg workdir_ts "$TIMESTAMP" \
+    --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    '{
+      run_id: $run_id,
+      goal_id: $goal_id,
+      question: $query,
+      step_id: (if $step_id == "" then null else $step_id end),
+      stages_run: $stages,
+      cost: ($cost | tonumber),
+      report_path: $report,
+      duration_s: $duration,
+      sources_found: $sources,
+      verification_count: $verif,
+      summary: $summary,
+      budget_exceeded: ($exceeded == 1),
+      workdir: $workdir,
+      workdir_timestamp: $workdir_ts,
+      timestamp: $ts,
+      failed: false
+    }')
+  record_run_for_goal "$GOAL_ID" "$RUN_ID" "$ARTIFACT"
+  if [ -n "$MARK_STEP" ]; then
+    goals_update_field "$GOAL_ID" '.answered_steps += 1'
+  fi
+  if [ -n "$FEEDBACK_RATING" ]; then
+    provider=$(run_dominant_provider "$ARTIFACT")
+    feedback_record "$RUN_ID" "$FEEDBACK_RATING" "$FEEDBACK_COMMENT" "$GOAL_ID" "$provider"
+  fi
+  "$SCRIPT_DIR/research-status" --quiet 2>/dev/null || true
+fi

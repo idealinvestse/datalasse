@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# research-decompose — Stage 1 of deep research pipeline
+# Takes a research question, returns 3-5 sub-queries as JSON.
+#
+# Usage:
+#   bin/research-decompose "What are the top AI agent platforms in 2026?"
+#   bin/research-decompose "Compare x402 vs Stripe" --num=5
+#
+# Requires: OPENROUTER_API_KEY (else uses default model fallback)
+
+set -euo pipefail
+
+OR_KEY="${OPENROUTER_API_KEY:-}"
+if [ -z "$OR_KEY" ]; then
+  echo "Error: OPENROUTER_API_KEY not set" >&2
+  echo "Setup: export OPENROUTER_API_KEY=... or use bin/load-secrets" >&2
+  exit 1
+fi
+MODEL="${DECOMPOSE_MODEL:-x-ai/grok-4.3}"
+MODEL="${MODEL#openrouter/}"
+NUM_SUBQUERIES=4
+RAW_OUTPUT=""
+QUERY=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --num=*)    NUM_SUBQUERIES="${1#*=}" ;;
+    --model=*)  MODEL="${1#*=}"; MODEL="${MODEL#openrouter/}" ;;
+    --raw)      RAW_OUTPUT="1" ;;
+    --help|-h)
+      sed -n '3,12p' "$0"
+      exit 0
+      ;;
+    *)          QUERY="$1" ;;
+  esac
+  shift
+done
+
+if [ -z "$QUERY" ]; then
+  echo "Usage: bin/research-decompose 'your question'" >&2
+  exit 1
+fi
+
+# System prompt: short, no nested quotes that break shell parsing
+SYSTEM_PROMPT="You are a research strategist. Decompose the user's research question into 3-5 focused sub-queries. Return ONLY a JSON array. No markdown, no commentary. Each element has: query (string, 3-10 words), type (instant/fast/auto/deep-lite/deep/deep-reasoning), max_results (3-10), rationale (10-15 words), output_schema (null or JSON schema with max 10 props and depth 2). Use instant/fast for keyword queries, auto for discovery, deep for multi-hop reasoning, deep-reasoning only for hardest synthesis."
+
+USER_PROMPT="Research question: $QUERY. Return exactly $NUM_SUBQUERIES sub-queries as a JSON array."
+
+# Use internal LLM router (Phase 3). Preserves temperature, max_tokens, model override via --model=.
+# group=subagent-research-quick for free-first + telemetry/caps. Prefix strip handled inside.
+RESP=$(bin/llm-call --group=subagent-research-quick \
+  --prompt="$USER_PROMPT" --system="$SYSTEM_PROMPT" \
+  --model="$MODEL" --temperature=0.3 --max-tokens=1500 --json 2>/dev/null || echo "")
+CONTENT=$(echo "$RESP" | jq -r '.content // empty')
+
+if [ -z "$CONTENT" ]; then
+  echo "Error: empty response from model" >&2
+  echo "$RESP" | jq . >&2
+  exit 1
+fi
+
+if [ -n "$RAW_OUTPUT" ]; then
+  echo "$CONTENT"
+  exit 0
+fi
+
+# Try to extract JSON array from response (model may wrap in markdown).
+# Use perl for multi-line match (bash grep -E doesn't match \n by default).
+JSON_CONTENT=$(echo "$CONTENT" | perl -0777 -ne 'if (m/\[.*\]/s) { print $& }' | head -c 100000)
+if [ -z "$JSON_CONTENT" ]; then
+  JSON_CONTENT="$CONTENT"
+fi
+
+if echo "$JSON_CONTENT" | jq -e 'type == "array"' >/dev/null 2>&1; then
+  echo "$JSON_CONTENT" | jq .
+  exit 0
+fi
+
+echo "Warning: model output was not valid JSON array. Raw output:" >&2
+echo "$CONTENT" >&2
+exit 1

@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# research-goal — CRUD for persistent research goals
+#
+# Usage:
+#   bin/research-goal add "question" [--priority=1-5] [--tags=tag1,tag2]
+#   bin/research-goal list [--active|--done|--all] [--json]
+#   bin/research-goal show <id>
+#   bin/research-goal update <id> [--status=active|done|paused] [--priority=N] [--notes="text"] [--add-note]
+#   bin/research-goal done <id> [--notes="..."]
+#   bin/research-goal plan <id>
+#   bin/research-goal --help
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+CMD=""
+GOAL_ID=""
+QUESTION=""
+PRIORITY=3
+TAGS=""
+FILTER="active"
+JSON_OUT=0
+STATUS=""
+NOTES=""
+ADD_NOTE=0
+
+usage() {
+  sed -n '3,12p' "$0"
+}
+
+parse_tags() {
+  local raw="$1"
+  if [ -z "$raw" ]; then
+    echo '[]'
+    return
+  fi
+  echo "$raw" | tr ',' '\n' | jq -R . | jq -s .
+}
+
+truncate_str() {
+  local s="$1"
+  local max="${2:-40}"
+  if [ "${#s}" -le "$max" ]; then
+    echo "$s"
+  else
+    echo "${s:0:$((max - 3))}..."
+  fi
+}
+
+cmd_add() {
+  if [ -z "$QUESTION" ]; then
+    echo "Usage: bin/research-goal add \"question\" [--priority=N] [--tags=a,b]" >&2
+    exit 1
+  fi
+  research_ensure_dirs
+  local id tags_json record
+  id=$(research_next_goal_id)
+  tags_json=$(parse_tags "$TAGS")
+  record=$(new_goal_record "$id" "$QUESTION" "$PRIORITY" "$tags_json")
+  goals_append_line "$record"
+  echo "$id"
+}
+
+cmd_list() {
+  research_ensure_dirs
+  local goals filtered
+  goals=$(goals_read_json)
+  case "$FILTER" in
+    active) filtered=$(echo "$goals" | jq '[.[] | select(.status == "active")]') ;;
+    done)   filtered=$(echo "$goals" | jq '[.[] | select(.status == "done")]') ;;
+    all)    filtered="$goals" ;;
+    *)      filtered=$(echo "$goals" | jq '[.[] | select(.status == "active")]') ;;
+  esac
+
+  if [ "$JSON_OUT" -eq 1 ]; then
+    echo "$filtered" | jq .
+    return
+  fi
+
+  local count
+  count=$(echo "$filtered" | jq 'length')
+  if [ "$count" -eq 0 ]; then
+    echo "No goals ($FILTER)."
+    return
+  fi
+
+  printf "%-16s %-6s %-8s %s\n" "ID" "PRI" "STATUS" "QUESTION"
+  while IFS=$'\t' read -r id pri st q; do
+    printf "%-16s %-6s %-8s %s\n" "$id" "$pri" "$st" "$(truncate_str "$q" 60)"
+  done < <(echo "$filtered" | jq -r '.[] | "\(.id)\t\(.priority)\t\(.status)\t\(.question)"')
+}
+
+cmd_show() {
+  if [ -z "$GOAL_ID" ]; then
+    echo "Usage: bin/research-goal show <id>" >&2
+    exit 1
+  fi
+  local goal
+  goal=$(goal_get "$GOAL_ID")
+  echo "$goal" | jq .
+
+  echo "" >&2
+  echo "Plan: $(echo "$goal" | jq -r '.plan_path')" >&2
+  if [ -f "$(echo "$goal" | jq -r '.plan_path')" ]; then
+    echo "--- plan excerpt ---" >&2
+    head -15 "$(echo "$goal" | jq -r '.plan_path')" >&2
+  fi
+
+  echo "" >&2
+  echo "Runs:" >&2
+  echo "$goal" | jq -r '.runs[]?' | while read -r rid; do
+    local rf="$RUNS_DIR/${rid}.json"
+    if [ -f "$rf" ]; then
+      echo "  $rid — cost=$(jq -r '.cost' "$rf") stages=$(jq -r '.stages_run' "$rf")" >&2
+    else
+      echo "  $rid — (artifact missing)" >&2
+    fi
+  done
+}
+
+cmd_update() {
+  if [ -z "$GOAL_ID" ]; then
+    echo "Usage: bin/research-goal update <id> [options]" >&2
+    exit 1
+  fi
+  goal_get "$GOAL_ID" >/dev/null
+
+  local now
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  goals_update_line "$GOAL_ID" \
+    --arg status "${STATUS:-}" \
+    --argjson priority "$PRIORITY" \
+    --argjson priority_set "${ORIG_PRIORITY_SET:-0}" \
+    --arg notes "$NOTES" \
+    --argjson add_note "$ADD_NOTE" \
+    --arg now "$now" \
+    'map(if .id == $gid then
+      .
+      | (if $status != "" then .status = $status else . end)
+      | (if $priority_set == 1 then .priority = $priority else . end)
+      | (if $add_note == 1 and $notes != "" then .notes += [{ts: $now, text: $notes}] else . end)
+      | .updated_at = $now
+    else . end)'
+
+  echo "Updated $GOAL_ID"
+}
+
+cmd_done() {
+  STATUS="done"
+  ADD_NOTE=0
+  if [ -n "$NOTES" ]; then
+    ADD_NOTE=1
+  fi
+  CMD="update"
+  cmd_update
+}
+
+cmd_plan() {
+  if [ -z "$GOAL_ID" ]; then
+    echo "Usage: bin/research-goal plan <id>" >&2
+    exit 1
+  fi
+  local goal question plan_path now
+  goal=$(goal_get "$GOAL_ID")
+  question=$(echo "$goal" | jq -r '.question')
+  plan_path=$(plan_path_for "$GOAL_ID")
+  now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+  OR_KEY="${OPENROUTER_API_KEY:-}"
+  if [ -n "$OR_KEY" ]; then
+    PLAN_MODEL="${DECOMPOSE_MODEL:-x-ai/grok-4.3}"
+    PLAN_MODEL="${PLAN_MODEL#openrouter/}"
+    SYS="You are a research planner. Break the goal into 3-7 concrete actionable research steps. Each step is a focused sub-question or task usable by deep-research. Return ONLY JSON array of objects: {step_id: 'step-N', question: string, rationale: string}."
+    USR="Goal question: $question. Generate 3-7 steps."
+    RESP=""
+    for att in 1 2; do
+      RESP=$(bin/llm-call --group=subagent-research-quick \
+        --prompt="$USR" --system="$SYS" \
+        --model="$PLAN_MODEL" --temperature=0.3 --max-tokens=1200 --json 2>/dev/null || echo "")
+      [ -n "$RESP" ] && break
+      sleep 1
+    done
+    CONTENT=$(echo "$RESP" | jq -r '.content // ""' | perl -0777 -ne 'if (m/\[.*\]/s) { print $& }' || echo "")
+    if echo "$CONTENT" | jq -e 'type=="array"' >/dev/null 2>&1; then
+      STEPS=$(echo "$CONTENT" | jq -c '.')
+      N=$(echo "$STEPS" | jq 'length')
+      {
+        echo "# Research Plan: $question"
+        echo "**Goal ID:** $GOAL_ID"
+        echo "**Generated:** $now"
+        echo "**Status:** LLM-generated via research-goal plan"
+        echo ""
+        echo "## Steps"
+        echo "$STEPS" | jq -r '.[] | "### \(.step_id): [pending] \(.question)\n\(.rationale)\n"'
+      } > "$plan_path"
+      goals_update_line "$GOAL_ID" \
+        --arg now "$now" \
+        --arg plan "$plan_path" \
+        --argjson n "$N" \
+        'map(if .id == $gid then .total_steps = $n | .plan_path = $plan | .updated_at = $now else . end)'
+      echo "Plan written (LLM): $plan_path ($N steps)"
+      return
+    fi
+  fi
+
+  # Fallback stub
+  cat > "$plan_path" <<EOF
+# Research Plan: $question
+**Goal ID:** $GOAL_ID
+**Generated:** $now
+**Status:** stub (no OPENROUTER or LLM failed)
+
+## Steps
+### step-1: [pending] Background and context for "$question"
+### step-2: [pending] Key players and current state
+### step-3: [pending] Future outlook and implications
+EOF
+
+  goals_update_line "$GOAL_ID" \
+    --arg now "$now" \
+    --arg plan "$plan_path" \
+    'map(if .id == $gid then .total_steps = 3 | .plan_path = $plan | .updated_at = $now else . end)'
+
+  echo "Plan written (stub): $plan_path"
+}
+
+# Parse global args
+ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --priority=*)
+      PRIORITY="${1#*=}"
+      ORIG_PRIORITY_SET=1
+      ;;
+    --tags=*)     TAGS="${1#*=}" ;;
+    --status=*)   STATUS="${1#*=}" ;;
+    --notes=*)    NOTES="${1#*=}" ;;
+    --add-note)   ADD_NOTE=1 ;;
+    --active)     FILTER="active" ;;
+    --done)       FILTER="done" ;;
+    --all)        FILTER="all" ;;
+    --json)       JSON_OUT=1 ;;
+    --help|-h)    usage; exit 0 ;;
+    add|list|show|update|done|plan)
+      if [ -n "$CMD" ]; then ARGS+=("$1"); else CMD="$1"; fi
+      ;;
+    *)
+      if [ -z "$GOAL_ID" ] && [[ "$1" == g-* ]]; then
+        GOAL_ID="$1"
+      elif [ -z "$QUESTION" ] && [ "$CMD" = "add" ]; then
+        QUESTION="$1"
+      else
+        ARGS+=("$1")
+      fi
+      ;;
+  esac
+  shift
+done
+
+# Handle positional overflow
+for a in "${ARGS[@]:-}"; do
+  if [ -z "$GOAL_ID" ] && [[ "$a" == g-* ]]; then
+    GOAL_ID="$a"
+  elif [ -z "$QUESTION" ] && [ "$CMD" = "add" ]; then
+    QUESTION="$a"
+  fi
+done
+
+case "${CMD:-}" in
+  add)    cmd_add ;;
+  list)   cmd_list ;;
+  show)   cmd_show ;;
+  update) cmd_update ;;
+  done)   cmd_done ;;
+  plan)   cmd_plan ;;
+  *)
+    echo "Usage: bin/research-goal <add|list|show|update|done|plan> ..." >&2
+    usage
+    exit 1
+    ;;
+esac

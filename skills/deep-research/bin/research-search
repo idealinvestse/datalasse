@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# research-search — simple semantic/keyword search over saved research reports
+#
+# Usage:
+#   bin/research-search "AI agents pricing"
+#   bin/research-search "EU AI Act" --json
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh" 2>/dev/null || true
+
+QUERY="$1"
+JSON_OUT=0
+shift || true
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json) JSON_OUT=1 ;;
+  esac
+  shift
+done
+
+if [ -z "$QUERY" ]; then
+  echo "Usage: bin/research-search QUERY [--json]" >&2
+  exit 1
+fi
+
+research_ensure_dirs
+
+qlower=$(echo "$QUERY" | tr '[:upper:]' '[:lower:]')
+
+results=()
+while IFS= read -r runf; do
+  [ -f "$runf" ] || continue
+  rp=$(jq -r '.report_path // empty' "$runf" 2>/dev/null || true)
+  [ -z "$rp" ] || [ ! -f "$rp" ] && continue
+  score=$(grep -o -i "$QUERY" "$rp" | wc -l | tr -d ' ')
+  if [ "${score:-0}" -gt 0 ]; then
+    goal=$(jq -r '.goal_id // "standalone"' "$runf")
+    q=$(jq -r '.question // ""' "$runf")
+    smry=$(head -c 180 "$rp" | tr '\n' ' ')
+    results+=("{\"score\":$score,\"goal\":\"$goal\",\"question\":\"$q\",\"report\":\"$rp\",\"snippet\":\"${smry//\"/\\\"}\"}")
+  fi
+done < <(find "$RUNS_DIR" -name '*.json' 2>/dev/null | head -100)
+
+if [ ${#results[@]} -eq 0 ]; then
+  if [ "$JSON_OUT" -eq 1 ]; then echo '[]'; else echo "No matches for: $QUERY"; fi
+  exit 0
+fi
+
+# naive rank + output
+if [ "$JSON_OUT" -eq 1 ]; then
+  printf '%s\n' "${results[@]}" | jq -s 'sort_by(-.score) | .[0:8]'
+else
+  echo "# Top matches for: $QUERY"
+  printf '%s\n' "${results[@]}" | jq -s 'sort_by(-.score) | .[0:8][] | "[\(.score)] \(.goal) — \(.question)\n    \(.report)\n    \(.snippet[0:160])..."' -r
+fi

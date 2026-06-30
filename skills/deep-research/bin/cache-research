@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+# cache-research — SQLite-backed search result cache
+#
+# Usage:
+#   bin/cache-research "query string" [--ttl=24h] [--type=auto] [--num=5]
+#   bin/cache-research --clear
+#   bin/cache-research --stats
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+CACHE_DB="${CACHE_DB:-${HOME}/.config/moss/research-cache.sqlite}"
+TTL="24h"
+TYPE="auto"
+NUM=5
+QUERY=""
+MODE="search"
+
+# shellcheck source=lib/fallback.sh
+source "$SCRIPT_DIR/lib/fallback.sh"
+
+parse_ttl_seconds() {
+  local ttl="$1"
+  local n unit
+  if [[ "$ttl" =~ ^([0-9]+)(s|m|h|d)$ ]]; then
+    n="${BASH_REMATCH[1]}"
+    unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+      s) echo "$n" ;;
+      m) echo $((n * 60)) ;;
+      h) echo $((n * 3600)) ;;
+      d) echo $((n * 86400)) ;;
+    esac
+    return 0
+  fi
+  echo "Error: invalid TTL format: $ttl (use e.g. 24h, 1h, 2s, 30m)" >&2
+  return 1
+}
+
+init_db() {
+  mkdir -p "$(dirname "$CACHE_DB")"
+  sqlite3 "$CACHE_DB" <<'SQL'
+CREATE TABLE IF NOT EXISTS results (
+  query_hash TEXT PRIMARY KEY,
+  query TEXT NOT NULL,
+  provider TEXT NOT NULL,
+  type TEXT,
+  num INTEGER,
+  result_json TEXT NOT NULL,
+  cost REAL DEFAULT 0,
+  created_at INTEGER NOT NULL,
+  expires_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_expires ON results(expires_at);
+CREATE TABLE IF NOT EXISTS stats (
+  key TEXT PRIMARY KEY,
+  value REAL NOT NULL DEFAULT 0
+);
+SQL
+}
+
+inc_stat() {
+  local key="$1"
+  local delta="${2:-1}"
+  sqlite3 "$CACHE_DB" "INSERT INTO stats(key,value) VALUES('$key',$delta) ON CONFLICT(key) DO UPDATE SET value=value+$delta;"
+}
+
+show_stats() {
+  init_db
+  local now total expired hits misses hit_rate cost_saved
+  now=$(date +%s)
+  total=$(sqlite3 "$CACHE_DB" "SELECT COUNT(*) FROM results WHERE expires_at > $now;")
+  expired=$(sqlite3 "$CACHE_DB" "SELECT COUNT(*) FROM results WHERE expires_at <= $now;")
+  hits=$(sqlite3 "$CACHE_DB" "SELECT COALESCE(value,0) FROM stats WHERE key='hits';" 2>/dev/null || echo 0)
+  misses=$(sqlite3 "$CACHE_DB" "SELECT COALESCE(value,0) FROM stats WHERE key='misses';" 2>/dev/null || echo 0)
+  cost_saved=$(sqlite3 "$CACHE_DB" "SELECT COALESCE(value,0) FROM stats WHERE key='cost_saved';" 2>/dev/null || echo 0)
+  hits=${hits:-0}
+  misses=${misses:-0}
+  cost_saved=${cost_saved:-0}
+  hit_rate=$(awk -v h="$hits" -v m="$misses" 'BEGIN {
+    if ((h + m) > 0) printf "%.1f", (h / (h + m)) * 100;
+    else printf "0.0";
+  }')
+  {
+    echo "Cache entries: $total ($expired expired pending --clear)"
+    echo "Hits: $hits | Misses: $misses | Hit rate: ${hit_rate}%"
+    printf 'Total cost saved: $%.2f\n' "$cost_saved"
+  } | tee /dev/stderr
+}
+
+clear_expired() {
+  init_db
+  local now deleted
+  now=$(date +%s)
+  deleted=$(sqlite3 "$CACHE_DB" "DELETE FROM results WHERE expires_at <= $now; SELECT changes();")
+  echo "Purged $deleted expired cache entries" >&2
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --ttl=*)   TTL="${1#*=}" ;;
+    --type=*)  TYPE="${1#*=}" ;;
+    --num=*)   NUM="${1#*=}" ;;
+    --clear)   MODE="clear" ;;
+    --stats)   MODE="stats" ;;
+    --help|-h)
+      sed -n '2,7p' "$0"
+      exit 0
+      ;;
+    *)         QUERY="$1" ;;
+  esac
+  shift
+done
+
+case "$MODE" in
+  clear)
+    clear_expired
+    exit 0
+    ;;
+  stats)
+    show_stats
+    exit 0
+    ;;
+esac
+
+if [ -z "$QUERY" ]; then
+  echo "Usage: bin/cache-research \"query\" [--ttl=24h] [--type=auto] [--num=5]" >&2
+  echo "       bin/cache-research --clear | --stats" >&2
+  exit 1
+fi
+
+init_db
+
+TTL_SEC=$(parse_ttl_seconds "$TTL")
+NOW=$(date +%s)
+EXPIRES=$((NOW + TTL_SEC))
+HASH_KEY="${QUERY}|${TYPE}|${NUM}"
+QUERY_HASH=$(printf '%s' "$HASH_KEY" | sha256sum | cut -d' ' -f1)
+
+CACHED_EXP=$(sqlite3 "$CACHE_DB" "SELECT expires_at FROM results WHERE query_hash='$QUERY_HASH';" 2>/dev/null || true)
+CACHED_JSON=$(sqlite3 "$CACHE_DB" "SELECT result_json FROM results WHERE query_hash='$QUERY_HASH';" 2>/dev/null || true)
+
+if [ -n "$CACHED_JSON" ] && [ -n "$CACHED_EXP" ]; then
+  if [ "$CACHED_EXP" -gt "$NOW" ]; then
+    inc_stat hits
+    cached_cost=$(sqlite3 "$CACHE_DB" "SELECT COALESCE(cost,0) FROM results WHERE query_hash='$QUERY_HASH';" 2>/dev/null || echo 0)
+    inc_stat cost_saved "${cached_cost:-0}"
+    export CACHE_HIT=1
+    echo "CACHE_HIT=1" >&2
+    echo "$CACHED_JSON"
+    exit 0
+  fi
+fi
+
+inc_stat misses
+
+TMP_OUT=$(mktemp)
+trap 'rm -f "$TMP_OUT"' EXIT
+
+if ! search_with_fallback "$QUERY" "$TYPE" "$NUM" "$TMP_OUT"; then
+  echo "Error: search failed for cache miss" >&2
+  exit 1
+fi
+
+RESULT_JSON=$(cat "$TMP_OUT")
+PROVIDER=$(echo "$RESULT_JSON" | jq -r '.provider // "unknown"')
+COST=$(echo "$RESULT_JSON" | jq -r '.costDollars.total // 0')
+
+sqlite3 "$CACHE_DB" "INSERT OR REPLACE INTO results
+  (query_hash, query, provider, type, num, result_json, cost, created_at, expires_at)
+  VALUES (
+    '$QUERY_HASH',
+    '$(printf '%s' "$QUERY" | sed "s/'/''/g")',
+    '$PROVIDER',
+    '$TYPE',
+    $NUM,
+    '$(printf '%s' "$RESULT_JSON" | sed "s/'/''/g")',
+    $COST,
+    $NOW,
+    $EXPIRES
+  );"
+
+echo "$RESULT_JSON"

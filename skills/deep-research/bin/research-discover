@@ -1,0 +1,165 @@
+#!/usr/bin/env bash
+# research-discover — auto-discover research gaps from status markdown
+#
+# Usage:
+#   bin/research-discover [--apply] [--json] [--source=path]
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+APPLY=0
+JSON_OUT=0
+SOURCE="${WORKSPACE_DIR}/projects/mossfund/STATUS.md"
+
+usage() {
+  sed -n '3,6p' "$0"
+}
+
+extract_candidates() {
+  local source_file="$1"
+  python3 - "$source_file" <<'PY'
+import json, re, sys
+
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+
+prefix_re = re.compile(r'^\s*(?:[-*]|\d+\.)?\s*(TBD|TODO|\?|Unknown|Need research)\b[:\s]*(.*)$', re.I)
+inline_re = re.compile(r'(no data|unclear|limited info)', re.I)
+keyword_re = re.compile(r'\b(rate|revenue|conversion|pricing|MCP|x402)\b', re.I)
+
+candidates = []
+seen = set()
+section = None
+
+def clean_line(s):
+    s = re.sub(r'^\s*(?:[-*]|\d+\.)\s*', '', s.strip())
+    s = re.sub(r'\*\*([^*]+)\*\*', r'\1', s)
+    return s.strip()
+
+def add_candidate(text, from_section=False):
+    text = clean_line(text)
+    if len(text) < 10:
+        return
+    key = text.lower()
+    if key in seen:
+        return
+    seen.add(key)
+    conf = 0.30
+    if len(text) >= 50:
+        conf += 0.20
+    if text.endswith('?'):
+        conf += 0.15
+    if from_section:
+        conf += 0.15
+    if keyword_re.search(text):
+        conf += 0.10
+    if len(text) >= 100:
+        conf += 0.10
+    conf = min(conf, 0.95)
+    tags = ["auto-discovered"]
+    if keyword_re.search(text):
+        m = keyword_re.search(text)
+        if m:
+            tags.append(m.group(1).lower())
+    candidates.append({
+        "question": text,
+        "confidence": round(conf, 2),
+        "tags": tags,
+        "priority": 2,
+    })
+
+for line in lines:
+    raw = line.rstrip('\n')
+    if raw.startswith('## '):
+        h = raw[3:].strip().lower()
+        if h in ('open questions', 'gaps'):
+            section = h
+        else:
+            section = None
+        continue
+
+    m = prefix_re.match(raw)
+    if m:
+        rest = m.group(2).strip() or m.group(1)
+        add_candidate(rest, from_section=section is not None)
+        continue
+
+    if section and raw.strip().startswith(('-', '*')):
+        add_candidate(raw, from_section=True)
+        continue
+
+    if inline_re.search(raw):
+        add_candidate(raw, from_section=section is not None)
+
+candidates.sort(key=lambda x: (-x['confidence'], x['question']))
+print(json.dumps(candidates))
+PY
+}
+
+filter_existing() {
+  local candidates_json="$1"
+  echo "$candidates_json" | jq -c '.[]' | while read -r cand; do
+    q=$(echo "$cand" | jq -r '.question')
+    if goal_question_exists_substr "$q"; then
+      continue
+    fi
+    echo "$cand"
+  done | jq -s '.'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) APPLY=1 ;;
+    --json) JSON_OUT=1 ;;
+    --source=*) SOURCE="${1#*=}" ;;
+    --help|-h) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+if [ ! -f "$SOURCE" ]; then
+  echo "Error: source not found: $SOURCE" >&2
+  exit 1
+fi
+
+research_ensure_dirs
+
+raw_candidates=$(extract_candidates "$SOURCE")
+candidates=$(filter_existing "$raw_candidates")
+generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+output=$(jq -n \
+  --arg generated_at "$generated_at" \
+  --arg source "$SOURCE" \
+  --argjson candidates "$candidates" \
+  '{generated_at: $generated_at, source: $source, candidates: $candidates}')
+
+atomic_write "$DISCOVERED_GOALS_FILE" "$(echo "$output" | jq -c .)"
+
+if [ "$APPLY" -eq 1 ]; then
+  echo "$output" | jq -c '.candidates[0:5][]' | while read -r cand; do
+    conf=$(echo "$cand" | jq -r '.confidence')
+    awk -v c="$conf" 'BEGIN { exit (c >= 0.5) ? 0 : 1 }' || continue
+    q=$(echo "$cand" | jq -r '.question')
+    tags=$(echo "$cand" | jq -r '.tags | join(",")')
+    new_id=$("$SCRIPT_DIR/research-goal" add "$q" --priority=2 --tags="$tags")
+    echo "Added goal: $new_id"
+  done
+fi
+
+if [ "$JSON_OUT" -eq 1 ]; then
+  echo "$output" | jq .
+  exit 0
+fi
+
+count=$(echo "$output" | jq '.candidates | length')
+echo "Discovered $count candidate(s) from $SOURCE"
+echo ""
+echo "$output" | jq -r '.candidates[0:5][] | "  [\(.confidence)] \(.question)"'
+echo ""
+echo "Output: $DISCOVERED_GOALS_FILE"

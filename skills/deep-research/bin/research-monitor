@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# research-monitor — basic topic monitoring (save + periodic run)
+#
+# Usage:
+#   bin/research-monitor add "EU AI Act updates" [--interval=1d]
+#   bin/research-monitor list
+#   bin/research-monitor run [--once]
+#
+# Stores in research state. Run periodically (user-managed cron).
+# Outputs new findings; external delivery (e.g. Telegram) is out of scope.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh" 2>/dev/null || true
+
+MONITOR_FILE="$RESEARCH_DIR/monitors.json"
+DEEP_RESEARCH="${DEEP_RESEARCH_BIN:-$SCRIPT_DIR/deep-research}"
+
+research_ensure_dirs
+[ ! -f "$MONITOR_FILE" ] && echo '[]' > "$MONITOR_FILE"
+
+cmd="$1"; shift || true
+
+case "$cmd" in
+  add)
+    topic="$*"
+    [ -z "$topic" ] && { echo "Usage: ... add <topic>"; exit 1; }
+    jq --arg t "$topic" --arg ts "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      '. + [{topic:$t, added:$ts, last_run:null, findings:[]}]' "$MONITOR_FILE" > "$MONITOR_FILE.tmp" && mv "$MONITOR_FILE.tmp" "$MONITOR_FILE"
+    echo "Added monitor: $topic"
+    ;;
+  list)
+    jq . "$MONITOR_FILE" 2>/dev/null || echo '[]'
+    ;;
+  run)
+    once=0
+    [ "${1:-}" = "--once" ] && once=1
+    mapfile -t mons < <(jq -r '.[].topic' "$MONITOR_FILE" 2>/dev/null || true)
+    for t in "${mons[@]}"; do
+      [ -z "$t" ] && continue
+      echo "▶ Running monitor: $t" >&2
+      out=$("$DEEP_RESEARCH" "$t" --depth=auto --budget=0.08 2>/dev/null | tail -c 4000 || echo "(run failed)")
+      # naive "new" = just the tail of this run
+      ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+      jq --arg t "$t" --arg ts "$ts" --arg o "$(echo "$out" | head -c 1200 | tr '\n' ' ')" '
+        map(if .topic == $t then .last_run=$ts | .findings += [$o] else . end)
+      ' "$MONITOR_FILE" > "$MONITOR_FILE.tmp" && mv "$MONITOR_FILE.tmp" "$MONITOR_FILE"
+      echo "=== New findings for $t ==="
+      echo "$out" | head -30
+    done
+    ;;
+  *)
+    echo "Usage: bin/research-monitor <add|list|run> ..." >&2
+    exit 1
+    ;;
+esac

@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# research-audit -- longitudinal / staleness checks on past reports
+#
+# Usage:
+#   bin/research-audit
+#   bin/research-audit --days=60 --goal=g-...
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh" 2>/dev/null || true
+
+DAYS=30
+GOAL_FILTER=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --days=*) DAYS="${1#*=}" ;;
+    --goal=*) GOAL_FILTER="${1#*=}" ;;
+    --help|-h)
+      echo "Usage: bin/research-audit [--days=N] [--goal=g-xxx]"
+      echo ""
+      echo "Scans past research runs and flags reports older than N days as potentially stale."
+      exit 0
+      ;;
+    *) echo "Unknown arg: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+research_ensure_dirs
+
+echo "# Research Audit -- reports older than ${DAYS}d may be stale"
+echo ""
+
+found=0
+now=$(date +%s)
+
+# Get all run JSON files (use a safe file list, not process substitution)
+run_files=$(find "$RUNS_DIR" -name '*.json' 2>/dev/null | head -80 || true)
+
+for rf in $run_files; do
+  [ -f "$rf" ] || continue
+  gid=$(jq -r '.goal_id // ""' "$rf" 2>/dev/null || echo "")
+  [ -n "$GOAL_FILTER" ] && [ "$gid" != "$GOAL_FILTER" ] && continue
+  ts=$(jq -r '.timestamp // ""' "$rf" 2>/dev/null || echo "")
+  rp=$(jq -r '.report_path // ""' "$rf" 2>/dev/null || echo "")
+  [ -z "$rp" ] && continue
+  [ ! -f "$rp" ] && continue
+
+  # crude age: epoch from timestamp (use python)
+  if [ -n "$ts" ]; then
+    epoch=$(python3 - "$ts" <<'PYEOF'
+import sys
+from datetime import datetime
+raw = sys.argv[1] if len(sys.argv) > 1 else ""
+try:
+    raw = raw.replace("Z", "+00:00") if "T" in raw else raw
+    dt = datetime.fromisoformat(raw)
+    print(int(dt.timestamp()))
+except Exception:
+    print(0)
+PYEOF
+)
+  else
+    epoch=0
+  fi
+
+  if [ "$epoch" = "0" ]; then
+    continue
+  fi
+
+  age_days=$(( (now - epoch) / 86400 ))
+
+  if [ "$age_days" -gt "$DAYS" ]; then
+    found=1
+    echo ""
+    echo "## ${rp}"
+    echo "  Goal: ${gid}, Age: ${age_days} days"
+    echo "  Re-run: bin/deep-research --goal=${gid} --depth=auto"
+    echo "  Top URLs to re-verify:"
+    grep -oE 'https?://[^[:space:]]+' "$rp" 2>/dev/null | head -3 | sed 's/^/    - /' || true
+  fi
+done
+
+if [ "$found" -eq 0 ]; then
+  echo ""
+  echo "(no reports older than ${DAYS}d found -- all fresh!)"
+fi

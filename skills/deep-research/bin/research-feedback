@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# research-feedback — quality ratings for research runs
+#
+# Usage:
+#   bin/research-feedback <run-id> --rating=1-5 [--comment="..."]
+#   bin/research-feedback list [--limit=20]
+#   bin/research-feedback stats
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# shellcheck source=lib/research-state.sh
+source "$SCRIPT_DIR/lib/research-state.sh"
+
+CMD=""
+RUN_ID=""
+RATING=""
+COMMENT=""
+LIMIT=20
+
+usage() {
+  sed -n '3,8p' "$0"
+}
+
+validate_rating() {
+  local r="$1"
+  if ! [[ "$r" =~ ^[1-5]$ ]]; then
+    echo "Error: rating must be integer 1-5" >&2
+    return 1
+  fi
+}
+
+resolve_provider_for_run() {
+  local run_id="$1"
+  local run_json provider
+  if run_json=$(run_get "$run_id" 2>/dev/null); then
+    provider=$(run_dominant_provider "$run_json")
+    echo "$provider"
+  else
+    echo "unknown"
+  fi
+}
+
+resolve_goal_for_run() {
+  local run_id="$1"
+  local run_json goal_id
+  if run_json=$(run_get "$run_id" 2>/dev/null); then
+    goal_id=$(echo "$run_json" | jq -r '.goal_id // "standalone"')
+    echo "$goal_id"
+  else
+    echo "standalone"
+  fi
+}
+
+cmd_submit() {
+  if [ -z "$RUN_ID" ]; then
+    echo "Usage: bin/research-feedback <run-id> --rating=1-5 [--comment=\"...\"]" >&2
+    exit 1
+  fi
+  if [ -z "$RATING" ]; then
+    echo "Error: --rating=1-5 required" >&2
+    exit 1
+  fi
+  validate_rating "$RATING"
+
+  local goal_id provider
+  goal_id=$(resolve_goal_for_run "$RUN_ID")
+  provider=$(resolve_provider_for_run "$RUN_ID")
+  feedback_record "$RUN_ID" "$RATING" "$COMMENT" "$goal_id" "$provider"
+  echo "Recorded feedback for $RUN_ID (rating=$RATING, goal=$goal_id)"
+}
+
+cmd_list() {
+  research_ensure_dirs
+  local items count
+  items=$(feedback_read_json | jq --argjson lim "$LIMIT" 'sort_by(.ts) | reverse | .[0:$lim]')
+  count=$(echo "$items" | jq 'length')
+  if [ "$count" -eq 0 ]; then
+    echo "No feedback recorded."
+    return 0
+  fi
+  printf "%-22s %-18s %-8s %-12s %s\n" "RUN_ID" "GOAL" "RATING" "PROVIDER" "COMMENT"
+  echo "$items" | jq -r '.[] | "\(.run_id)\t\(.goal_id)\t\(.rating)\t\(.provider // "unknown")\t\(.comment // "")"' \
+    | while IFS=$'\t' read -r rid gid rat prov com; do
+        printf "%-22s %-18s %-8s %-12s %s\n" "$rid" "$gid" "$rat" "$prov" "$(echo "$com" | cut -c1-40)"
+      done
+}
+
+cmd_stats() {
+  research_ensure_dirs
+  local feedback enriched
+  feedback=$(feedback_read_json)
+
+  enriched=$(echo "$feedback" | jq -c '.[]' | while read -r row; do
+    local rid prov
+    rid=$(echo "$row" | jq -r '.run_id')
+    prov=$(echo "$row" | jq -r '.provider // empty')
+    if [ -z "$prov" ] || [ "$prov" = "null" ]; then
+      prov=$(resolve_provider_for_run "$rid")
+      row=$(echo "$row" | jq --arg p "$prov" '.provider = $p')
+    fi
+    echo "$row"
+  done | jq -s '.')
+
+  echo "=== Feedback stats ==="
+  echo ""
+  echo "Per goal:"
+  echo "$enriched" | jq -r '
+    group_by(.goal_id)
+    | map({goal: .[0].goal_id, count: length, avg: ([.[].rating] | add / length)})
+    | sort_by(-.count)[]
+    | "  \(.goal): \(.count) ratings, avg \(.avg | . * 10 | round / 10)"'
+
+  echo ""
+  echo "Per provider:"
+  echo "$enriched" | jq -r '
+    group_by(.provider)
+    | map({provider: (.[0].provider // "unknown"), count: length, avg: ([.[].rating] | add / length)})
+    | sort_by(-.count)[]
+    | "  \(.provider): \(.count) ratings, avg \(.avg | . * 10 | round / 10)"'
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --rating=*)  RATING="${1#*=}" ;;
+    --comment=*) COMMENT="${1#*=}" ;;
+    --limit=*)   LIMIT="${1#*=}" ;;
+    --help|-h)   usage; exit 0 ;;
+    list|stats)
+      if [ -n "$CMD" ]; then
+        echo "Error: multiple commands" >&2
+        exit 1
+      fi
+      CMD="$1"
+      ;;
+    *)
+      if [ -z "$RUN_ID" ] && [[ "$1" != -* ]]; then
+        RUN_ID="$1"
+      else
+        echo "Unknown argument: $1" >&2
+        exit 1
+      fi
+      ;;
+  esac
+  shift
+done
+
+if [ -n "$CMD" ]; then
+  case "$CMD" in
+    list)  cmd_list ;;
+    stats) cmd_stats ;;
+  esac
+  exit 0
+fi
+
+if [ -n "$RUN_ID" ]; then
+  cmd_submit
+  exit 0
+fi
+
+usage >&2
+exit 1
