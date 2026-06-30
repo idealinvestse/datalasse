@@ -42,8 +42,9 @@ else
 fi
 
 # 2. no key
+# HOME=$TMP prevents exa-search from sourcing real secrets.env as fallback
 set +e
-out=$(EXA_API_KEY= PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q" 2>&1); code=$?
+out=$(EXA_API_KEY= HOME="$TMP" PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q" 2>&1); code=$?
 set -e
 if [ $code -eq 1 ] && echo "$out" | grep -q "EXA_API_KEY not set"; then
   echo "PASS no key"
@@ -53,7 +54,7 @@ fi
 
 # 3. invalid key -> api error path
 set +e
-out=$(MOCK_EXA_ERROR=1 EXA_API_KEY=badkey PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q" 2>&1); code=$?
+out=$(MOCK_EXA_ERROR=1 EXA_API_KEY=badkey HOME="$TMP" PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q" 2>&1); code=$?
 set -e
 if [ $code -eq 2 ] && echo "$out" | grep -q "Exa API error\|Exa /search error"; then
   echo "PASS invalid key error"
@@ -61,19 +62,21 @@ else
   echo "FAIL invalid key: code=$code out=$out"; exit 1
 fi
 
-# 4. happy path
+# 4. happy path (with --json so we can validate schema)
+# Note: exa-search --json outputs .results array (not the full response with costDollars)
 set +e
-out=$(EXA_API_KEY=dummy PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "test query" --num=3 2>&1); code=$?
+out=$(EXA_API_KEY=dummy HOME="$TMP" PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "test query" --count=3 --json 2>&1); code=$?
 set -e
-if [ $code -eq 0 ] && echo "$out" | jq -e '.results[0].url and .costDollars.total' >/dev/null 2>&1; then
+if [ $code -eq 0 ] && echo "$out" | jq -e '.[0].url and .[0].title' >/dev/null 2>&1; then
   echo "PASS happy"
 else
   echo "FAIL happy: code=$code out=$out"; exit 1
 fi
 
-# 5. --pretty and --type parse (at least runs)
+# 5. --json and --type=keyword parse (at least runs)
+# Note: exa-search has no --pretty (output is markdown by default, --json for compact)
 set +e
-out=$(EXA_API_KEY=dummy PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q2" --pretty --type=deep 2>&1); code=$?
+out=$(EXA_API_KEY=dummy HOME="$TMP" PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q2" --json --type=keyword 2>&1); code=$?
 set -e
 if [ $code -eq 0 ] && echo "$out" | jq -e . >/dev/null 2>&1; then
   echo "PASS pretty+type"
@@ -81,14 +84,14 @@ else
   echo "FAIL pretty+type: code=$code out=$out"; exit 1
 fi
 
-# 6. compact json valid
+# 6. compact markdown valid (default format, just check exit code)
 set +e
-out=$(EXA_API_KEY=dummy PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q3" 2>&1); code=$?
+out=$(EXA_API_KEY=dummy HOME="$TMP" PATH="$MOCKDIR:$PATH" "$TESTBIN/exa-search" "q3" 2>&1); code=$?
 set -e
-if [ $code -eq 0 ] && echo "$out" | jq -e 'type == "object"' >/dev/null; then
-  echo "PASS json valid"
+if [ $code -eq 0 ]; then
+  echo "PASS compact markdown"
 else
-  echo "FAIL json valid"; exit 1
+  echo "FAIL compact markdown: code=$code out=$out"; exit 1
 fi
 
 echo "All exa-search tests passed"

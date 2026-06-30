@@ -199,14 +199,16 @@ sub_queries=$(grok_query "$USER_QUESTION" --extract=sub_queries.json)
 for q in $sub_queries; do
   type=$(echo "$q" | jq -r .type)
   case "$type" in
-    instant|fast|auto)  bin/exa-search "$(echo "$q" | jq -r .query)" --type=$type --num=$(echo "$q" | jq -r .max_results) & ;;
+    instant|fast|auto)  bin/exa-search "$(echo "$q" | jq -r .query)" --type=$type --count=$(echo "$q" | jq -r .max_results) & ;;
     keyword)            bin/serper-search "$(echo "$q" | jq -r .query)" --num=$(echo "$q" | jq -r .max_results) & ;;
   esac
 done
 wait
 
 # 3. Deep retrieval (Stage 3) om multi-hop
-bin/exa-search "complex_query" --type=deep --system-prompt="..." --output-schema=@deep.json &
+# (FUTURE: --system-prompt + --output-schema stöds ännu inte av bin/exa-search.
+#  För strukturerad output, använd bin/exa-research --output-schema=@deep.json istället.)
+bin/exa-search "complex_query" --type=deep &
 
 # 4. Content extraction (Stage 4) om RAG-style
 bin/exa-contents "$URLS" --text-max=20000 &
