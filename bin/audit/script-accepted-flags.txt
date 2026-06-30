@@ -1,0 +1,35 @@
+cache-research|--ttl --type --num --clear --stats
+deep-research|--depth --budget --goal --recipe --synth-model --output --output-schema --mark-step --language --feedback --feedback-comment --audit --visualize --interactive --text-max --track-plays
+deep-research-test|--help
+exa-contents|--file --highlights --max-age --text-max
+exa-research|--model --output-schema --wait --fire-and-forget --pretty
+exa-search|--count --type --json
+fal-safety-audit|--dry-run --force-recheck --json
+fal-safety-reset|--dry --json
+github-watchdog|
+llm-call|--group --prompt --system --max-tokens --temperature --model --dry-run --json --rollup --config --help
+load-secrets|
+parallel-research|--topics --synthesize --output-dir --timeout --manifest --count --model
+refresh-vps-snapshot|
+research-audit|--days --goal
+research-decompose|--num --raw
+research-digest|--date --json --telegram
+research-discover|--apply --json --source
+research-feedback|--rating --comment --limit
+research-goal|--priority --tags --add-note --status --notes --all --active --done --json
+research-graph|--help
+research-improve|--json
+research-init|--reset
+research-metrics|--json --period
+research-monitor|--interval --once
+research-prioritize|--apply --json --weights
+research-recipe|--help
+research-search|--json
+research-status|--json --quiet
+research-watch|--all --due --exec --goal
+secrets-validate|--fix --report
+serper-search|--num --type --pretty
+source-score|
+vps-status|--json --section --top --no-color --watch --help
+ytmusic|--pretty
+ytmusic-picks-daily|
