@@ -121,6 +121,12 @@
       "blocked_since": "2026-07-01",
       "owner": "Moss (investigate if pattern persists)",
       "impact": "Generates false-positive alerts, not a real problem"
+    },
+    {
+      "ts": "2026-07-01T18:43:54Z",
+      "question": "Vem är Kqg? Sov-mönster: 23+",
+      "context": "Oscar nämnde 'Kqg sover oftast ganska sent, typ 23 eller senare' — oklart om det är Paulina, en ny kontakt, eller nån annan.",
+      "status": "awaiting_clarification"
     }
   ],
   "recent_decisions": [
@@ -260,7 +266,16 @@
         "communication_style": "warm, emojis, casual Swedish (🌸🌸)",
         "dietary_preference": "light, weight-conscious"
       }
-    }
+    },
+    "people_mentioned": [
+      {
+        "name": "Kqg (oklar)",
+        "first_mentioned": "2026-07-01T18:43:54Z",
+        "fact": "sover oftast sent, typ 23 eller senare",
+        "status": "awaiting_clarification"
+      }
+    ],
+    "last_updated": "2026-07-01T18:44:00Z"
   },
   "next_session_bootstrap": {
     "load_order": [
@@ -364,6 +379,12 @@
         "type": "lesson",
         "ts": "2026-07-01T16:35:21Z",
         "preview": "openclaw message tool tillåter INTE media-path under /root/.moss-private/ (secur"
+      },
+      {
+        "id": "fact-1782924276743",
+        "type": "fact",
+        "ts": "2026-07-01T16:44:36Z",
+        "preview": "Oklar person 'Kqg' sover sent (typ 23+). Vem?: väntar på svar från Oscar. 2026-0"
       }
     ],
     "stats": {}
