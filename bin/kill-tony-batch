@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Batch-processa flera Kill Tony-episoder parallellt.
+
+Användning:
+    kill-tony-batch --episodes 1,33,114,121 --max-parallel 3
+    kill-tony-batch --from-research memory/research/kill-tony-top-40-2026.md --max-parallel 3
+    kill-tony-batch --from-research FILE --skip-analyzed --max-parallel 3
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+DB_PATH = WORKSPACE / "data" / "kill-tony" / "kill_tony.db"
+
+
+def log(msg: str, level: str = "info") -> None:
+    icon = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}.get(level, "·")
+    ts = time.strftime("%H:%M:%S")
+    print(f"{ts} {icon} {msg}", flush=True)
+
+
+def parse_episodes_from_research(path: Path) -> list[int]:
+    """Parsa episodnummer från en deep-research markdown."""
+    text = path.read_text()
+    nums = sorted(set(int(m.group(1)) for m in re.finditer(r"#(\d+)", text)))
+    return nums
+
+
+def get_db_status(ep_num: int) -> dict:
+    """Hämta status för en episod från DB."""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    row = c.execute("""
+        SELECT episode_number, title, audio_url, analyzed, transcript_path, cost_usd
+        FROM episodes WHERE episode_number=?
+    """, (ep_num,)).fetchone()
+    conn.close()
+    if not row:
+        return {"found": False, "ep": ep_num}
+    return {
+        "found": True,
+        "ep": row[0],
+        "title": row[1],
+        "has_audio": bool(row[2]),
+        "analyzed": bool(row[3]),
+        "transcript_exists": bool(row[4]) and Path(row[4]).exists() if row[4] else False,
+        "cost_so_far": row[5] or 0,
+    }
+
+
+def ingest_one(ep_num: int, skip_if_analyzed: bool = True) -> dict:
+    """Kör bin/kill-tony ingest för en episod. Returnerar resultat-dict."""
+    status = get_db_status(ep_num)
+    if not status["found"]:
+        return {"ep": ep_num, "status": "missing", "msg": "Episod finns inte i DB"}
+    if not status["has_audio"]:
+        return {"ep": ep_num, "status": "no_audio", "msg": "Ingen audio-URL"}
+    if skip_if_analyzed and status["analyzed"]:
+        return {"ep": ep_num, "status": "already_done", "msg": "Redan analyserad"}
+    # Kör ingest
+    log(f"Startar ingest av #{ep_num}: {status['title'][:60]}", "step")
+    t0 = time.time()
+    try:
+        r = subprocess.run(
+            ["python3", str(WORKSPACE / "bin" / "kill-tony"), "ingest", str(ep_num)],
+            capture_output=True, text=True, timeout=1800, cwd=str(WORKSPACE),
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        elapsed = time.time() - t0
+        if r.returncode == 0:
+            return {"ep": ep_num, "status": "ok", "elapsed": elapsed, "title": status["title"]}
+        return {
+            "ep": ep_num, "status": "error", "elapsed": elapsed,
+            "msg": r.stderr[-300:] or r.stdout[-300:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"ep": ep_num, "status": "timeout", "elapsed": time.time() - t0}
+    except Exception as e:
+        return {"ep": ep_num, "status": "exception", "msg": str(e)}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--episodes", help="komma-separerade episodnummer")
+    parser.add_argument("--from-research", help="path till research markdown (extrahera #N)")
+    parser.add_argument("--max-parallel", type=int, default=3)
+    parser.add_argument("--skip-analyzed", action="store_true", default=True)
+    parser.add_argument("--no-skip-analyzed", dest="skip_analyzed", action="store_false")
+    args = parser.parse_args()
+    # Bygg lista
+    if args.episodes:
+        ep_nums = sorted(set(int(n.strip()) for n in args.episodes.split(",") if n.strip()))
+    elif args.from_research:
+        ep_nums = parse_episodes_from_research(Path(args.from_research))
+    else:
+        log("Måste ange --episodes eller --from-research", "err")
+        return 1
+    log(f"Batch: {len(ep_nums)} episoder, max {args.max_parallel} parallella", "step")
+    # Pre-check
+    statuses = [get_db_status(n) for n in ep_nums]
+    found = sum(1 for s in statuses if s["found"])
+    has_audio = sum(1 for s in statuses if s.get("has_audio"))
+    already_done = sum(1 for s in statuses if s.get("analyzed"))
+    log(f"  · I DB: {found}/{len(ep_nums)}", "info")
+    log(f"  · Har audio-URL: {has_audio}/{len(ep_nums)}", "info")
+    log(f"  · Redan analyserade: {already_done}/{len(ep_nums)}", "info")
+    # Kör parallellt
+    results = []
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=args.max_parallel) as executor:
+        futures = {
+            executor.submit(ingest_one, n, args.skip_analyzed): n
+            for n in ep_nums
+        }
+        for future in as_completed(futures):
+            ep = futures[future]
+            try:
+                res = future.result()
+            except Exception as e:
+                res = {"ep": ep, "status": "exception", "msg": str(e)}
+            results.append(res)
+            icon = {"ok": "✅", "error": "❌", "timeout": "⏱", "missing": "❓",
+                    "no_audio": "🔇", "already_done": "⏭", "exception": "💥"}.get(res["status"], "?")
+            log(f"#{ep:4d} → {icon} {res['status']} {res.get('msg', '')[:100]}", "info")
+    # Summering
+    total = time.time() - t0
+    by_status = {}
+    for r in results:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + 1
+    log(f"=== Batch klar på {total:.0f}s ===", "ok")
+    for status, count in sorted(by_status.items()):
+        log(f"  {status}: {count}", "info")
+    # Spara rapport
+    report = {
+        "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t0)),
+        "elapsed_seconds": round(total),
+        "total_episodes": len(ep_nums),
+        "by_status": by_status,
+        "results": results,
+    }
+    out = WORKSPACE / "data" / "kill-tony" / f"batch-{int(t0)}.json"
+    out.write_text(json.dumps(report, indent=2))
+    log(f"Rapport: {out}", "ok")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
