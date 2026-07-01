@@ -91,6 +91,9 @@ yarn-error.log*
 
 # ---------- Transient directories ----------
 tmp/
+
+# Radicale cron backup log (regenerated daily)
+.radicale-backup.log
 incoming/
 
 # ---------- Editor / OS ----------
