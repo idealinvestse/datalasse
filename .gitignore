@@ -127,3 +127,6 @@ Thumbs.db
 
 # Moss private (outside the security boundary — never commit)
 .moss-private/
+
+# Atomic-write temp files (cleanup if they escape the rename)
+*.tmp.*
