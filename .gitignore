@@ -130,3 +130,11 @@ Thumbs.db
 
 # Atomic-write temp files (cleanup if they escape the rename)
 *.tmp.*
+
+# Kill Tony pipeline: data + audio (för stor för git)
+data/kill-tony/audio-cache/
+data/kill-tony/transcripts/ep-*-chunks/
+data/kill-tony/transcripts/ep-*.transcript.json
+data/kill-tony/frames/
+data/kill-tony/feed.xml
+data/kill-tony/kill_tony.db

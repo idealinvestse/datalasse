@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+"""kill-tony: pipeline för att ladda ner, transkribera och analysera Kill Tony-episoder.
+
+Användning:
+    kill-tony ingest <episode_number>     # ladda ner + transkribera + analysera
+    kill-tony list [--limit N]            # lista kända episoder
+    kill-tony show <episode_number>       # visa info + analys
+    kill-tony search <query>              # sök i alla transcripts
+    kill-tony episodes                    # alias för list
+    kill-tony status                      # health + DB-stats
+    kill-tony doctor                      # diagnostik
+
+Pipeline per episod:
+    1. Hämta RSS-feed (cachad i data/kill-tony/feed.xml)
+    2. Hitta audio-URL för episode_number
+    3. Ladda ner audio (mp3 128kbps) till audio-cache
+    4. Konvertera till 16kHz mono 64kbps mp3 (mindre för Groq)
+    5. Dela i 10-min chunkar
+    6. Transkribera varje chunk med Groq Whisper
+    7. Sammanfoga transcripts med timestamps
+    8. LLM-analys: extrahera gäster, höjdpunkter, struktur
+    9. Spara allt i SQLite + markdown summary
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+# Paths
+WORKSPACE = Path(__file__).resolve().parents[1]
+DATA_DIR = WORKSPACE / "data" / "kill-tony"
+AUDIO_CACHE = DATA_DIR / "audio-cache"
+TRANSCRIPT_DIR = DATA_DIR / "transcripts"
+FRAMES_DIR = DATA_DIR / "frames"
+FEED_PATH = DATA_DIR / "feed.xml"
+DB_PATH = DATA_DIR / "kill_tony.db"
+FEED_URL = "https://feeds.simplecast.com/JZSQrle9"
+
+# Groq config
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+WHISPER_MODEL = "whisper-large-v3-turbo"
+WHISPER_PRICE_PER_HOUR = 0.04  # USD
+CHUNK_SECONDS = 600  # 10 min per chunk
+
+
+def log(msg: str, level: str = "info") -> None:
+    icon = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}.get(level, "·")
+    ts = datetime.now().strftime("%H:%M:%S")
+    print(f"{ts} {icon} {msg}", flush=True)
+
+
+def ensure_dirs() -> None:
+    for d in [DATA_DIR, AUDIO_CACHE, TRANSCRIPT_DIR, FRAMES_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+
+def load_feed(force_refresh: bool = False) -> str:
+    """Hämta RSS-flödet (cachat i 1h)."""
+    if not force_refresh and FEED_PATH.exists():
+        age = time.time() - FEED_PATH.stat().st_mtime
+        if age < 3600:
+            return FEED_PATH.read_text()
+    log(f"Hämtar RSS från {FEED_URL}", "step")
+    r = subprocess.run(["curl", "-s", "-m", "30", FEED_URL], capture_output=True, text=True, check=True)
+    FEED_PATH.write_text(r.stdout)
+    log(f"RSS sparad: {len(r.stdout)} bytes", "ok")
+    return r.stdout
+
+
+def parse_episodes(feed_xml: str) -> list[dict]:
+    """Parse RSS-flödet och returnera lista med episoder."""
+    import re
+    episodes = []
+    # Hitta alla <item>-block
+    for m in re.finditer(r"<item>(.*?)</item>", feed_xml, re.DOTALL):
+        item = m.group(1)
+        title = re.search(r"<title>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</title>", item, re.DOTALL)
+        pub = re.search(r"<pubDate>(.*?)</pubDate>", item)
+        dur = re.search(r'<itunes:duration>(.*?)</itunes:duration>', item)
+        desc = re.search(r"<description>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</description>", item, re.DOTALL)
+        enc = re.search(r'<enclosure[^>]+url="([^"]+)"', item)
+        guid = re.search(r"<guid[^>]*>(.*?)</guid>", item, re.DOTALL)
+
+        title_str = title.group(1).strip() if title else "Unknown"
+        # Extract episode number from title "KILL TONY #774 - ..."
+        ep_match = re.search(r"#(\d+)", title_str)
+        ep_num = int(ep_match.group(1)) if ep_match else None
+
+        dur_str = dur.group(1).strip() if dur else ""
+        # Convert duration to seconds: "HH:MM:SS" or "MM:SS" or seconds
+        if ":" in dur_str:
+            parts = [int(p) for p in dur_str.split(":")]
+            if len(parts) == 3:
+                dur_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            else:
+                dur_sec = parts[0] * 60 + parts[1]
+        else:
+            dur_sec = int(dur_str) if dur_str.isdigit() else 0
+
+        episodes.append({
+            "episode_number": ep_num,
+            "title": title_str,
+            "pub_date": pub.group(1).strip() if pub else None,
+            "duration_seconds": dur_sec,
+            "description": (desc.group(1) if desc else "").strip()[:2000],
+            "audio_url": enc.group(1) if enc else None,
+            "guid": guid.group(1) if guid else None,
+        })
+    return episodes
+
+
+def db_connect() -> sqlite3.Connection:
+    return sqlite3.connect(DB_PATH)
+
+
+def db_init() -> None:
+    conn = db_connect()
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS episodes (
+            id INTEGER PRIMARY KEY,
+            episode_number INTEGER UNIQUE,
+            title TEXT NOT NULL,
+            pub_date TEXT,
+            duration_seconds INTEGER,
+            audio_url TEXT,
+            description TEXT,
+            guid TEXT,
+            downloaded_path TEXT,
+            transcript_path TEXT,
+            analyzed BOOLEAN DEFAULT 0,
+            analysis_json TEXT,
+            cost_usd REAL,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS transcript_segments (
+            id INTEGER PRIMARY KEY,
+            episode_id INTEGER NOT NULL,
+            chunk_index INTEGER,
+            start_time REAL,
+            end_time REAL,
+            text TEXT,
+            FOREIGN KEY (episode_id) REFERENCES episodes(id)
+        );
+        CREATE TABLE IF NOT EXISTS analysis_highlights (
+            id INTEGER PRIMARY KEY,
+            episode_id INTEGER NOT NULL,
+            category TEXT,
+            timestamp_start REAL,
+            description TEXT,
+            FOREIGN KEY (episode_id) REFERENCES episodes(id)
+        );
+        CREATE TABLE IF NOT EXISTS analysis_guests (
+            id INTEGER PRIMARY KEY,
+            episode_id INTEGER NOT NULL,
+            name TEXT,
+            role TEXT,
+            notes TEXT,
+            FOREIGN KEY (episode_id) REFERENCES episodes(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_episodes_number ON episodes(episode_number);
+        CREATE INDEX IF NOT EXISTS idx_transcript_episode ON transcript_segments(episode_id);
+        CREATE INDEX IF NOT EXISTS idx_highlights_episode ON analysis_highlights(episode_id);
+        CREATE INDEX IF NOT EXISTS idx_guests_episode ON analysis_guests(episode_id);
+    """)
+    conn.commit()
+    conn.close()
+
+
+def db_upsert_episode(ep: dict) -> int:
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("""
+        INSERT INTO episodes (episode_number, title, pub_date, duration_seconds, audio_url, description, guid, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(episode_number) DO UPDATE SET
+            title=excluded.title,
+            pub_date=excluded.pub_date,
+            duration_seconds=excluded.duration_seconds,
+            audio_url=excluded.audio_url,
+            description=excluded.description,
+            guid=excluded.guid,
+            updated_at=CURRENT_TIMESTAMP
+    """, (ep["episode_number"], ep["title"], ep["pub_date"], ep["duration_seconds"],
+          ep["audio_url"], ep["description"], ep["guid"]))
+    conn.commit()
+    row = c.execute("SELECT id FROM episodes WHERE episode_number=?", (ep["episode_number"],)).fetchone()
+    conn.close()
+    return row[0]
+
+
+def download_audio(ep_num: int, audio_url: str, out_path: Path) -> bool:
+    if out_path.exists() and out_path.stat().st_size > 1_000_000:
+        log(f"Audio finns redan: {out_path.name} ({out_path.stat().st_size // 1024 // 1024} MB)", "ok")
+        return True
+    log(f"Laddar ner episod #{ep_num}...", "step")
+    r = subprocess.run(["ffmpeg", "-y", "-i", audio_url, "-c", "copy",
+                        "-loglevel", "warning", str(out_path)],
+                       capture_output=True, text=True, timeout=900)
+    if r.returncode != 0:
+        log(f"Nedladdning misslyckades: {r.stderr[-200:]}", "err")
+        return False
+    size_mb = out_path.stat().st_size / 1024 / 1024
+    log(f"Nedladdad: {out_path.name} ({size_mb:.0f} MB)", "ok")
+    return True
+
+
+def convert_to_chunks(in_path: Path, ep_num: int) -> list[Path]:
+    """Konvertera mp3 till 16kHz mono 64kbps chunks om 10 min."""
+    chunk_dir = TRANSCRIPT_DIR / f"ep-{ep_num}-chunks"
+    chunk_dir.mkdir(parents=True, exist_ok=True)
+    pattern = chunk_dir / "chunk-%03d.mp3"
+    # Hoppa över om chunks redan finns
+    existing = sorted(chunk_dir.glob("chunk-*.mp3"))
+    if existing:
+        log(f"Chunks finns redan: {len(existing)} st", "ok")
+        return existing
+    log(f"Konverterar + delar i {CHUNK_SECONDS}s chunks...", "step")
+    r = subprocess.run([
+        "ffmpeg", "-y", "-i", str(in_path),
+        "-ac", "1", "-ar", "16000", "-b:a", "64k",
+        "-f", "segment", "-segment_time", str(CHUNK_SECONDS),
+        "-reset_timestamps", "1",
+        "-loglevel", "warning", str(pattern)
+    ], capture_output=True, text=True, timeout=300)
+    if r.returncode != 0:
+        log(f"Chunking misslyckades: {r.stderr[-200:]}", "err")
+        return []
+    chunks = sorted(chunk_dir.glob("chunk-*.mp3"))
+    log(f"Skapade {len(chunks)} chunks", "ok")
+    return chunks
+
+
+def transcribe_chunk(chunk_path: Path) -> dict:
+    """Transkribera en chunk med Groq Whisper. Returnerar {text, segments}."""
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY saknas", "err")
+        return {"text": "", "segments": []}
+    import requests
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    with open(chunk_path, "rb") as f:
+        audio_data = f.read()
+    # verbose_json ger segments med timestamps
+    files = {"file": (chunk_path.name, audio_data, "audio/mpeg")}
+    data = {
+        "model": WHISPER_MODEL,
+        "response_format": "verbose_json",
+        "language": "en",
+        "timestamp_granularities[]": "segment",
+    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    r = requests.post(url, files=files, data=data, headers=headers, timeout=300)
+    if r.status_code != 200:
+        log(f"Whisper fel {r.status_code}: {r.text[:200]}", "err")
+        return {"text": "", "segments": []}
+    result = r.json()
+    return {
+        "text": result.get("text", ""),
+        "segments": result.get("segments", []),
+    }
+
+
+def transcribe_episode(ep_num: int, chunks: list[Path], ep_id: int) -> tuple[Path, float]:
+    """Transkribera alla chunks, returnera (transcript_path, total_cost_usd)."""
+    out_path = TRANSCRIPT_DIR / f"ep-{ep_num}.transcript.json"
+    if out_path.exists():
+        log(f"Transcript finns redan: {out_path.name}", "ok")
+        # Beräkna sparad kostnad
+        return out_path, 0.0
+    log(f"Transkriberar {len(chunks)} chunks med Groq Whisper ({WHISPER_MODEL})...", "step")
+    all_segments = []
+    total_text = []
+    total_duration_sec = 0
+    t0 = time.time()
+    for i, chunk in enumerate(chunks, 1):
+        # Hitta duration av chunk
+        dur_result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                    "-of", "default=noprint_wrappers=1:nokey=1", str(chunk)],
+                                   capture_output=True, text=True)
+        try:
+            chunk_dur = float(dur_result.stdout.strip())
+        except ValueError:
+            chunk_dur = CHUNK_SECONDS
+        total_duration_sec += chunk_dur
+        offset = (i - 1) * CHUNK_SECONDS
+        log(f"  Chunk {i}/{len(chunks)}: {chunk.name} ({chunk_dur:.0f}s, offset {offset}s)", "step")
+        result = transcribe_chunk(chunk)
+        # Lägg till offset till timestamps
+        for seg in result.get("segments", []):
+            all_segments.append({
+                "start": round(seg.get("start", 0) + offset, 2),
+                "end": round(seg.get("end", 0) + offset, 2),
+                "text": seg.get("text", "").strip(),
+            })
+        if result["text"]:
+            total_text.append(f"[{offset//60}:{offset%60:02d}] {result['text']}")
+        # Progress
+        elapsed = time.time() - t0
+        if i > 0:
+            eta = (elapsed / i) * (len(chunks) - i)
+            log(f"    ETA: {eta:.0f}s (total: {elapsed:.0f}s)", "info")
+    transcript = {
+        "episode_number": ep_num,
+        "model": WHISPER_MODEL,
+        "total_duration_seconds": round(total_duration_sec, 1),
+        "total_segments": len(all_segments),
+        "full_text_with_timestamps": "\n".join(total_text),
+        "segments": all_segments,
+        "created_at": datetime.now().isoformat() + "Z",
+    }
+    out_path.write_text(json.dumps(transcript, indent=2))
+    cost = (total_duration_sec / 3600) * WHISPER_PRICE_PER_HOUR
+    log(f"Transcript sparad: {len(all_segments)} segments, ~${cost:.4f}", "ok")
+    # Spara i DB
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("UPDATE episodes SET transcript_path=?, cost_usd=COALESCE(cost_usd,0)+? WHERE id=?", (str(out_path), cost, ep_id))
+    c.executemany("INSERT INTO transcript_segments (episode_id, chunk_index, start_time, end_time, text) VALUES (?, ?, ?, ?, ?)",
+                  [(ep_id, i, s["start"], s["end"], s["text"]) for i, s in enumerate(all_segments)])
+    conn.commit()
+    conn.close()
+    return out_path, cost
+
+
+def analyze_episode(ep_num: int, transcript: dict, ep_id: int) -> dict:
+    """LLM-analys av transcript: gäster, höjdpunkter, struktur."""
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY saknas - hoppar analys", "warn")
+        return {}
+    # Begränsa transcript-längd för att passa i context
+    text = transcript.get("full_text_with_timestamps", "")
+    if len(text) > 80_000:
+        log(f"Transcript trunkerat från {len(text)} till 80k tecken för LLM-analys", "warn")
+        text = text[:80_000] + "\n\n[... transcript trunkerat ...]"
+    import requests
+    # Använd Groq compound (router) eller direkt Llama 3.3 70B
+    url = "https://api.groq.com/openai/v1/chat/completions"
+    prompt = f"""Analysera detta transcript från Kill Tony episod #{ep_num} (standup-podcast med Tony Hinchcliffe, Brian Redban, gäster och bucket pullers).
+
+Extrahera och returnera JSON med:
+- "main_guests": lista med namn på huvudgäster (de intervjuade under lång tid)
+- "bucket_pullers": lista med namn på de som drog namn ur hinken och gjorde 1-min standup (ofta 5-7 st)
+- "co_hosts": [Tony Hinchcliffe, Brian Redban, andra co-hosts]
+- "highlights": lista med {{category: "joke"|"moment"|"controversy"|"bucket_pull", description: str, approx_timestamp: "MM:SS" eller null}}
+- "summary": 2-3 meningar som sammanfattar episoden
+- "tone": "raunchy"|"political"|"absurd"|"heartwarming"|"mixed" (hur skulle du klassificera tonen)
+- "best_moment": str (en mening om bästa ögonblicket)
+
+Returnera BARA valid JSON, ingen annan text. Transcript (med tidsstämplar):
+
+{text}
+"""
+    data = {
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": "Du är en expert på att analysera standup-podcasts. Svara alltid med valid JSON."},
+            {"role": "user", "content": prompt},
+        ],
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+        "max_tokens": 4000,
+    }
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
+    log("LLM-analys (Groq llama-3.3-70b)...", "step")
+    r = requests.post(url, json=data, headers=headers, timeout=120)
+    if r.status_code != 200:
+        log(f"LLM-analys fel {r.status_code}: {r.text[:200]}", "err")
+        return {}
+    result = r.json()
+    content = result["choices"][0]["message"]["content"]
+    try:
+        analysis = json.loads(content)
+    except json.JSONDecodeError as e:
+        log(f"JSON-parse misslyckades: {e}", "err")
+        log(f"Raw: {content[:500]}", "info")
+        return {}
+    # Spara i DB
+    conn = db_connect()
+    c = conn.cursor()
+    c.execute("UPDATE episodes SET analyzed=1, analysis_json=? WHERE id=?", (json.dumps(analysis), ep_id))
+    # Insert guests
+    for role_key, role in [("main_guests", "main_guest"), ("bucket_pullers", "bucket_puller"),
+                            ("co_hosts", "co_host")]:
+        for name in analysis.get(role_key, []):
+            if isinstance(name, str) and name.strip():
+                c.execute("INSERT INTO analysis_guests (episode_id, name, role) VALUES (?, ?, ?)",
+                          (ep_id, name.strip(), role))
+    # Insert highlights
+    for h in analysis.get("highlights", []):
+        ts = h.get("approx_timestamp", "")
+        ts_sec = None
+        if ts and ":" in str(ts):
+            try:
+                parts = [int(p) for p in str(ts).split(":")]
+                if len(parts) == 2:
+                    ts_sec = parts[0] * 60 + parts[1]
+                elif len(parts) == 3:
+                    ts_sec = parts[0] * 3600 + parts[1] * 60 + parts[2]
+            except (ValueError, TypeError):
+                pass
+        c.execute("INSERT INTO analysis_highlights (episode_id, category, timestamp_start, description) VALUES (?, ?, ?, ?)",
+                  (ep_id, h.get("category", "other"), ts_sec, h.get("description", "")[:500]))
+    conn.commit()
+    conn.close()
+    log(f"Analys klar: {len(analysis.get('highlights', []))} höjdpunkter, {len(analysis.get('main_guests', []))} huvudgäster", "ok")
+    return analysis
+
+
+# === CLI-kommandon ===
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    """Ladda ner + transkribera + analysera EN episod."""
+    if not GROQ_API_KEY:
+        log("GROQ_API_KEY saknas - kan inte transkribera", "err")
+        return 1
+    ensure_dirs()
+    db_init()
+    ep_num = args.episode
+    log(f"=== Ingest episod #{ep_num} ===", "step")
+    feed = load_feed()
+    episodes = parse_episodes(feed)
+    target = next((e for e in episodes if e["episode_number"] == ep_num), None)
+    if not target:
+        log(f"Episod #{ep_num} hittades inte i feed ({len(episodes)} episoder)", "err")
+        return 1
+    log(f"Hittade: {target['title'][:80]}", "ok")
+    log(f"Duration: {target['duration_seconds']//60} min, Pub: {target['pub_date']}", "info")
+    ep_id = db_upsert_episode(target)
+    log(f"DB id: {ep_id}", "info")
+    # 1. Ladda ner
+    audio_path = AUDIO_CACHE / f"ep-{ep_num}.mp3"
+    if not download_audio(ep_num, target["audio_url"], audio_path):
+        return 1
+    # 2. Konvertera + dela i chunks
+    chunks = convert_to_chunks(audio_path, ep_num)
+    if not chunks:
+        return 1
+    # 3. Transkribera
+    transcript_path, transcribe_cost = transcribe_episode(ep_num, chunks, ep_id)
+    transcript = json.loads(transcript_path.read_text())
+    # 4. Analysera
+    analysis = analyze_episode(ep_num, transcript, ep_id)
+    # 5. Spara markdown summary
+    summary_path = DATA_DIR / f"ep-{ep_num}-summary.md"
+    summary_path.write_text(format_summary(ep_num, target, transcript, analysis, transcribe_cost))
+    log(f"=== Klart! Summary: {summary_path.name} ===", "ok")
+    return 0
+
+
+def format_summary(ep_num: int, target: dict, transcript: dict, analysis: dict, cost: float) -> str:
+    """Formatera en markdown-summary av episoden."""
+    md = f"""# Kill Tony #{ep_num}
+
+**Titel:** {target['title']}
+**Publicerad:** {target['pub_date']}
+**Duration:** {target['duration_seconds']//60} min ({target['duration_seconds']}s)
+**Audio:** {target.get('audio_url', 'N/A')[:100]}
+
+## Sammanfattning
+
+{analysis.get('summary', 'N/A')}
+
+**Ton:** {analysis.get('tone', 'N/A')}
+**Bästa ögonblick:** {analysis.get('best_moment', 'N/A')}
+
+## Huvudgäster
+
+{chr(10).join(f'- {g}' for g in analysis.get('main_guests', [])) or '- N/A'}
+
+## Bucket Pullers
+
+{chr(10).join(f'- {b}' for b in analysis.get('bucket_pullers', [])) or '- N/A'}
+
+## Co-hosts
+
+{chr(10).join(f'- {c}' for c in analysis.get('co_hosts', [])) or '- N/A'}
+
+## Höjdpunkter
+
+"""
+    for h in analysis.get("highlights", []):
+        ts = h.get("approx_timestamp", "?")
+        cat = h.get("category", "other")
+        desc = h.get("description", "")
+        md += f"- **[{ts}] {cat}**: {desc}\n"
+    md += f"""
+## Transkript-info
+
+- **Modell:** {transcript.get('model', 'N/A')}
+- **Segments:** {transcript.get('total_segments', 0)}
+- **Duration analyserad:** {transcript.get('total_duration_seconds', 0)}s
+- **Kostnad (Whisper):** ~${cost:.4f}
+
+## Första 1000 tecken av transkript
+
+```
+{transcript.get('full_text_with_timestamps', '')[:1000]}
+...
+```
+"""
+    return md
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    """Lista kända episoder."""
+    ensure_dirs()
+    db_init()
+    feed = load_feed()
+    episodes = parse_episodes(feed)
+    # Upsert alla till DB
+    for ep in episodes:
+        if ep["episode_number"]:
+            db_upsert_episode(ep)
+    # Hämta från DB sorterat
+    conn = db_connect()
+    c = conn.cursor()
+    rows = c.execute("""
+        SELECT episode_number, title, pub_date, duration_seconds, analyzed
+        FROM episodes
+        ORDER BY episode_number DESC
+        LIMIT ?
+    """, (args.limit,)).fetchall()
+    conn.close()
+    print(f"\n=== {len(rows)} episoder (senaste först) ===\n")
+    for ep_num, title, pub, dur, analyzed in rows:
+        marker = "✅" if analyzed else "·"
+        dur_min = (dur or 0) // 60
+        print(f"{marker} #{ep_num:4d} | {dur_min:3d} min | {pub[:10] if pub else '?':10s} | {title[:60]}")
+    return 0
+
+
+def cmd_show(args: argparse.Namespace) -> int:
+    """Visa info + analys för EN episod."""
+    db_init()
+    conn = db_connect()
+    c = conn.cursor()
+    ep = c.execute("SELECT * FROM episodes WHERE episode_number=?", (args.episode,)).fetchone()
+    if not ep:
+        log(f"Episod #{args.episode} hittades inte. Kör 'kill-tony list' först.", "err")
+        return 1
+    cols = [d[0] for d in c.description]
+    ep_dict = dict(zip(cols, ep))
+    analysis = json.loads(ep_dict.get("analysis_json") or "{}")
+    print(f"\n=== Episod #{ep_dict['episode_number']} ===")
+    print(f"Titel:    {ep_dict['title']}")
+    print(f"Pub:      {ep_dict['pub_date']}")
+    print(f"Duration: {ep_dict['duration_seconds']//60} min")
+    print(f"Analyzed: {bool(ep_dict.get('analyzed'))}")
+    print(f"Cost:     ${ep_dict.get('cost_usd') or 0:.4f}")
+    if analysis:
+        print(f"\nSammanfattning: {analysis.get('summary', 'N/A')}")
+        print(f"Ton:           {analysis.get('tone', 'N/A')}")
+        print(f"Main guests:   {', '.join(analysis.get('main_guests', []))}")
+        print(f"Bucket pullers: {', '.join(analysis.get('bucket_pullers', []))}")
+        print(f"\nHöjdpunkter:")
+        for h in analysis.get("highlights", []):
+            print(f"  - [{h.get('approx_timestamp', '?')}] {h.get('category', '?')}: {h.get('description', '')[:120]}")
+    conn.close()
+    return 0
+
+
+def cmd_search(args: argparse.Namespace) -> int:
+    """Sök i alla transcripts."""
+    db_init()
+    conn = db_connect()
+    c = conn.cursor()
+    rows = c.execute("""
+        SELECT e.episode_number, e.title, ts.start_time, ts.text
+        FROM transcript_segments ts
+        JOIN episodes e ON ts.episode_id = e.id
+        WHERE ts.text LIKE ?
+        ORDER BY e.episode_number DESC, ts.start_time
+        LIMIT 30
+    """, (f"%{args.query}%",)).fetchall()
+    conn.close()
+    if not rows:
+        print(f"Inga träffar för '{args.query}'")
+        return 0
+    print(f"\n=== Träffar för '{args.query}' ({len(rows)}) ===\n")
+    for ep_num, title, start, text in rows:
+        ts_min = int(start // 60)
+        ts_sec = int(start % 60)
+        print(f"#{ep_num} [{ts_min:02d}:{ts_sec:02d}] {text[:150]}")
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """DB + disk-stats."""
+    if not DB_PATH.exists():
+        print("Ingen databas än. Kör 'kill-tony list' först.")
+        return 0
+    conn = db_connect()
+    c = conn.cursor()
+    n_eps = c.execute("SELECT COUNT(*) FROM episodes").fetchone()[0]
+    n_analyzed = c.execute("SELECT COUNT(*) FROM episodes WHERE analyzed=1").fetchone()[0]
+    n_transcripts = c.execute("SELECT COUNT(*) FROM transcript_segments").fetchone()[0]
+    n_highlights = c.execute("SELECT COUNT(*) FROM analysis_highlights").fetchone()[0]
+    n_guests = c.execute("SELECT COUNT(*) FROM analysis_guests").fetchone()[0]
+    total_cost = c.execute("SELECT COALESCE(SUM(cost_usd), 0) FROM episodes").fetchone()[0]
+    conn.close()
+    print(f"\n=== Kill Tony DB Status ===\n")
+    print(f"Episoder i DB:     {n_eps}")
+    print(f"Analyserade:       {n_analyzed}")
+    print(f"Transkript segments: {n_transcripts}")
+    print(f"Höjdpunkter:       {n_highlights}")
+    print(f"Gäster (alla):     {n_guests}")
+    print(f"Totalkostnad:      ${total_cost:.4f}")
+    # Audio cache
+    audio_files = list(AUDIO_CACHE.glob("*.mp3"))
+    audio_size = sum(f.stat().st_size for f in audio_files) / 1024 / 1024
+    print(f"\nAudio cache: {len(audio_files)} filer, {audio_size:.0f} MB")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Diagnostik: dependencies + nycklar + paths."""
+    print("\n=== Kill Tony Doctor ===\n")
+    print(f"ffmpeg:    {subprocess.run(['which', 'ffmpeg'], capture_output=True, text=True).stdout.strip() or '❌'}")
+    print(f"ffprobe:   {subprocess.run(['which', 'ffprobe'], capture_output=True, text=True).stdout.strip() or '❌'}")
+    print(f"GROQ key:  {'✅' if GROQ_API_KEY else '❌'}")
+    print(f"RSS feed:  {FEED_PATH.exists()}")
+    print(f"Database:  {DB_PATH.exists()}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="kill-tony", description="Kill Tony downloader, transcriber, analyzer")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_ingest = sub.add_parser("ingest", help="ladda ner + transkribera + analysera EN episod")
+    p_ingest.add_argument("episode", type=int, help="episodnummer (t.ex. 774)")
+    p_list = sub.add_parser("list", help="lista kända episoder")
+    p_list.add_argument("--limit", type=int, default=20)
+    p_show = sub.add_parser("show", help="visa info + analys för EN episod")
+    p_show.add_argument("episode", type=int)
+    p_search = sub.add_parser("search", help="sök i alla transcripts")
+    p_search.add_argument("query")
+    sub.add_parser("episodes", help="alias för list")
+    sub.add_parser("status", help="DB + disk-stats")
+    sub.add_parser("doctor", help="diagnostik")
+    args = parser.parse_args()
+    handlers = {
+        "ingest": cmd_ingest, "list": cmd_list, "episodes": cmd_list,
+        "show": cmd_show, "search": cmd_search, "status": cmd_status, "doctor": cmd_doctor,
+    }
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
