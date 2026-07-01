@@ -30,9 +30,10 @@ Usage: bin/moss/image-flow.sh <command> [options]
 
 Commands:
   receive <telegram_file_id>
-      [--from USER] [--caption TEXT] [--context NOTE]
-      Download via Telegram getFile, store securely, update index/state.
-      Returns local path on stdout. Idempotent.
+      [--from USER] [--from-path LOCAL_PATH]
+      [--caption TEXT] [--context NOTE]
+      Download via Telegram getFile OR copy from local path (e.g. OpenClaw inbound cache),
+      store securely, update index/state. Returns local path on stdout. Idempotent.
 
   send <local_path> <target_chat_id>
       [--caption TEXT]
@@ -271,6 +272,7 @@ validate_secure_path() {
 # --- receive ---
 cmd_receive() {
   local file_id=""
+  local from_path=""
   local from_id="unknown"
   local caption=""
   local context=""
@@ -278,47 +280,74 @@ cmd_receive() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --from) from_id="$2"; shift 2 ;;
+      --from-path) from_path="$2"; shift 2 ;;
       --caption) caption="$2"; shift 2 ;;
       --context) context="$2"; shift 2 ;;
       *) if [[ -z "$file_id" ]]; then file_id="$1"; else echo "Unknown arg: $1" >&2; usage; exit 1; fi; shift ;;
     esac
   done
 
-  if [[ -z "$file_id" ]]; then
-    echo "receive requires <telegram_file_id>" >&2; exit 1
+  if [[ -z "$file_id" && -z "$from_path" ]]; then
+    echo "receive requires <telegram_file_id> or --from-path <local_path>" >&2; exit 1
   fi
 
   ensure_media_dir
-  local token
-  token=$(get_tg_token)
 
-  # get file info
-  local info
-  info=$(tg_get_file "$file_id" "$token")
-  local tg_file_path tg_size
-  tg_file_path=$(python3 -c "
+  # --- from-path mode: file already on disk (e.g. OpenClaw inbound cache) ---
+  if [[ -n "$from_path" ]]; then
+    if [[ ! -f "$from_path" ]]; then
+      echo "ERROR: --from-path file not found: $from_path" >&2; exit 1
+    fi
+    # extract extension from filename
+    local ext="${from_path##*.}"
+    ext="${ext,,}"  # lowercase
+    case "$ext" in
+      jpg|jpeg|png|webp|heic) : ;;
+      *) echo "ERROR: unsupported extension: .$ext" >&2; exit 1 ;;
+    esac
+    # synthesize a stable file_id from path + mtime so re-runs are idempotent
+    local path_hash
+    path_hash=$(sha256_of "$from_path" | cut -c1-32)
+    file_id="local-${path_hash}"
+  else
+    local token
+    token=$(get_tg_token)
+  fi
+
+  # get file info (skip for from-path)
+  local info="" tg_file_path="" tg_size=0 ext tmp
+  if [[ -z "$from_path" ]]; then
+    info=$(tg_get_file "$file_id" "$token")
+    tg_file_path=$(python3 -c "
 import json,sys
 print(json.loads(sys.argv[1]).get('file_path',''))
 " "$info")
-  tg_size=$(python3 -c "
+    tg_size=$(python3 -c "
 import json,sys
 print(json.loads(sys.argv[1]).get('file_size',0))
 " "$info")
 
-  if [[ -z "$tg_file_path" ]]; then
-    echo "ERROR: could not resolve file_path for $file_id" >&2
-    exit 1
+    if [[ -z "$tg_file_path" ]]; then
+      echo "ERROR: could not resolve file_path for $file_id" >&2
+      exit 1
+    fi
+
+    ext="jpg"
+    case "${tg_file_path##*.}" in
+      jpg|jpeg|png|webp|gif) ext="${tg_file_path##*.}" ;;
+    esac
+    [[ "$ext" == "jpeg" ]] && ext="jpg"
+
+    local dl_url="https://api.telegram.org/file/bot${token}/${tg_file_path}"
+    tmp="/tmp/moss-recv-$$-${RANDOM}.tmp"
+    download_file "$dl_url" "$tmp"
+  else
+    ext="${from_path##*.}"
+    ext="${ext,,}"
+    [[ "$ext" == "jpeg" ]] && ext="jpg"
+    tmp="/tmp/moss-recv-$$-${RANDOM}.${ext}"
+    cp "$from_path" "$tmp"
   fi
-
-  local ext="jpg"
-  case "${tg_file_path##*.}" in
-    jpg|jpeg|png|webp|gif) ext="${tg_file_path##*.}" ;;
-  esac
-  [[ "$ext" == "jpeg" ]] && ext="jpg"
-
-  local dl_url="https://api.telegram.org/file/bot${token}/${tg_file_path}"
-  local tmp="/tmp/moss-recv-$$-${RANDOM}.tmp"
-  download_file "$dl_url" "$tmp"
 
   local sha size
   sha=$(sha256_of "$tmp")

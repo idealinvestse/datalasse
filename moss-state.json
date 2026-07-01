@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "last_updated": "2026-07-01T15:23:10Z",
+  "last_updated": "2026-07-01T16:27:21Z",
   "session_id": "main-2026-07-01-1400",
   "updated_by": "Moss (self-initiated, during free-creative block 14:05-17:00)",
   "active_goals": [
@@ -215,6 +215,20 @@
               "status": "delivered"
             }
           ]
+        },
+        {
+          "filename": "2026-07-01-oscar-middag-med-sallad-och-kyckling.jpg",
+          "original_telegram_file_id": "local-008438ea4880c41833861c09d73ccc41",
+          "sha256": "008438ea4880c41833861c09d73ccc41775345da9d21f970fda200b4d2b7e502",
+          "size_bytes": 113483,
+          "received_from": "438805461 (oscar)",
+          "received_at": "2026-07-01T16:27:21Z",
+          "shared_with": [],
+          "context": "Oscars kvällsmat 18:25, hemlagad med Felix Chipotle + Caesar + rosé",
+          "captions": [
+            "middag med sallad och kyckling"
+          ],
+          "delivery_log": []
         }
       ],
       "last_updated": "2026-07-01T17:30:00Z"
@@ -306,6 +320,18 @@
         "type": "project",
         "ts": "2026-07-01T15:34:30Z",
         "preview": "Moss Architecture 2.0 — M0 done (identity+state+tools), M1 scaffold (knowledge g"
+      },
+      {
+        "id": "code-ref-1782923297194",
+        "type": "code-ref",
+        "ts": "2026-07-01T16:28:16Z",
+        "preview": "image-flow.sh --from-path mode: hanterar redan-nedladdade filer (OpenClaw inboun"
+      },
+      {
+        "id": "preference-1782923298623",
+        "type": "preference",
+        "ts": "2026-07-01T16:28:17Z",
+        "preview": "Oscar: hemlagad mat framför takeout, gärna sallad + protein + vin (rosé eller vi"
       }
     ],
     "stats": {}
