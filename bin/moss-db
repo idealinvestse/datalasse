@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""moss-db: CLI for the unified MariaDB + MongoDB wrapper.
+
+Subcommands:
+  status
+  stats
+  mariadb exec "SQL"
+  mariadb migrate <name>
+  mongodb collections
+  mongodb find <coll> [--query JSON] [--limit N]
+  mongodb insert <coll> --doc JSON
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Make "from moss_db" work when run as bin/moss-db
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE / "skills"))
+
+from moss_db import DatabaseManager, sanitize_mongo_query  # noqa: E402
+
+db = DatabaseManager.from_env()
+
+
+def log(msg: str, level: str = "info") -> None:
+    icons = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}
+    icon = icons.get(level, "·")
+    print(f"{icon} {msg}", flush=True)
+
+
+def _print_rows(rows: list) -> None:
+    if not rows:
+        print("(no rows)")
+        return
+    for r in rows:
+        if isinstance(r, dict):
+            print(json.dumps(r, default=str))
+        else:
+            print(r)
+
+
+def cmd_status(_args: argparse.Namespace) -> int:
+    h = db.health()
+    print(json.dumps(h, indent=2))
+    return 0
+
+
+def cmd_stats(_args: argparse.Namespace) -> int:
+    s = db.stats
+    print(json.dumps(s, indent=2))
+    return 0
+
+
+def cmd_mariadb_exec(args: argparse.Namespace) -> int:
+    sql = args.sql
+    try:
+        with db.mariadb() as conn:
+            res = conn.execute(sql)
+            if res.rows:
+                _print_rows(res.rows)
+            else:
+                print(f"OK (rowcount={res.rowcount}, last_id={res.last_id})")
+        return 0
+    except Exception as e:
+        log(f"MariaDB error: {e}", "err")
+        return 2
+
+
+def cmd_mariadb_migrate(args: argparse.Namespace) -> int:
+    name = args.name
+    try:
+        res = db.migrate("moss_main", name)
+        print(json.dumps(res, default=str, indent=2))
+        return 0 if res.get("applied") or "skipped" in res else 1
+    except Exception as e:
+        log(f"Migration error: {e}", "err")
+        return 2
+
+
+def cmd_mongodb_collections(_args: argparse.Namespace) -> int:
+    try:
+        with db.mongodb() as mdb:
+            cols = mdb.list_collection_names()
+        print("\n".join(sorted(cols)) or "(no collections)")
+        return 0
+    except Exception as e:
+        log(f"MongoDB error: {e}", "err")
+        return 1
+
+
+def cmd_mongodb_find(args: argparse.Namespace) -> int:
+    coll_name = args.collection
+    q = {}
+    if args.query:
+        try:
+            q = json.loads(args.query)
+            q = sanitize_mongo_query(q) or {}
+        except Exception as e:
+            log(f"Bad query JSON: {e}", "err")
+            return 2
+    limit = args.limit or 20
+    try:
+        with db.mongodb(coll_name) as coll:
+            cur = coll.find(q).limit(limit)
+            docs = list(cur)
+        print(json.dumps(docs, default=str, indent=2))
+        return 0
+    except Exception as e:
+        log(f"MongoDB find error: {e}", "err")
+        return 2
+
+
+def cmd_mongodb_insert(args: argparse.Namespace) -> int:
+    coll_name = args.collection
+    try:
+        doc = json.loads(args.doc)
+    except Exception as e:
+        log(f"Bad doc JSON: {e}", "err")
+        return 2
+    try:
+        with db.mongodb(coll_name) as coll:
+            res = coll.insert_one(doc)
+        print(json.dumps({"inserted_id": str(res.inserted_id)}, indent=2))
+        return 0
+    except Exception as e:
+        log(f"MongoDB insert error: {e}", "err")
+        return 2
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="moss-db", description="Moss unified DB CLI")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    # status
+    p = sub.add_parser("status", help="Health of both databases")
+    p.set_defaults(func=cmd_status)
+
+    # stats
+    p = sub.add_parser("stats", help="Query/connection stats")
+    p.set_defaults(func=cmd_stats)
+
+    # mariadb
+    pm = sub.add_parser("mariadb", help="MariaDB commands")
+    msub = pm.add_subparsers(dest="maria_cmd", required=True)
+
+    pe = msub.add_parser("exec", help="Run SQL (parameterise in app code)")
+    pe.add_argument("sql", help="SQL statement")
+    pe.set_defaults(func=cmd_mariadb_exec)
+
+    pmig = msub.add_parser("migrate", help="Run named migration (idempotent)")
+    pmig.add_argument("name", help="Migration name (without .sql)")
+    pmig.set_defaults(func=cmd_mariadb_migrate)
+
+    # mongodb
+    pg = sub.add_parser("mongodb", help="MongoDB commands")
+    gsub = pg.add_subparsers(dest="mongo_cmd", required=True)
+
+    pc = gsub.add_parser("collections", help="List collections")
+    pc.set_defaults(func=cmd_mongodb_collections)
+
+    pf = gsub.add_parser("find", help="Find documents")
+    pf.add_argument("collection")
+    pf.add_argument("--query", default=None, help='JSON filter e.g. \'{"tags":"x"}\'')
+    pf.add_argument("--limit", type=int, default=20)
+    pf.set_defaults(func=cmd_mongodb_find)
+
+    pi = gsub.add_parser("insert", help="Insert one document")
+    pi.add_argument("collection")
+    pi.add_argument("--doc", required=True, help='JSON document')
+    pi.set_defaults(func=cmd_mongodb_insert)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        return 130
+    except Exception as e:
+        log(f"Error: {e}", "err")
+        if os.environ.get("DEBUG"):
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
