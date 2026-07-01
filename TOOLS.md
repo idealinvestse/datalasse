@@ -149,7 +149,7 @@ Other research-grade models to consider:
 
 Research workflows using Brave (via `web_search`):
 - Main session research queries
-- Research subagents: deep-research, research-goal, research-watch, research-feedback, research-refresh, research-prioritize, research-discover
+- Research subagents: deep-research (now consolidated in skills/deep-research/), research-goal, research-watch, research-feedback, research-prioritize, research-discover (shims in bin/ forward to skill)
 - grok-build research-dispatcher (delegates to subagents)
 
 ---
