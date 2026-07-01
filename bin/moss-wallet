@@ -1,0 +1,401 @@
+#!/usr/bin/env python3
+"""moss-wallet: Self-custody Bitcoin HD wallet CLI for Moss.
+
+Subcommands:
+  init, restore, status, addresses, balance, receive, send, export-backup
+
+Security: Passphrase prompted. Encrypted storage only. PSBT builds only.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Workspace-aware imports (match ffmpeg-vision / fal-image pattern)
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE))
+
+from skills.moss_wallet import (
+    generate_mnemonic,
+    validate_mnemonic,
+    derive_address,
+    derive_first_addresses,
+    encrypt_mnemonic,
+    decrypt_mnemonic,
+    get_passphrase,
+    confirm_passphrase,
+    load_keystore,
+    save_keystore,
+    load_config,
+    save_config,
+    set_network,
+    get_current_network,
+    bump_receive_index,
+    write_audit,
+    is_keystore_present,
+    fetch_balance,
+    fetch_utxos,
+    build_unsigned_psbt,
+    validate_address,
+    sats_to_btc,
+    btc_to_sats,
+    WALLET_BASE,
+)
+
+# --------------------------- helpers ---------------------------
+
+def log(msg: str, level: str = "info") -> None:
+    icons = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}
+    icon = icons.get(level, "·")
+    print(f"{icon} {msg}", flush=True)
+
+
+def get_effective_network(args: argparse.Namespace) -> str:
+    testnet = getattr(args, "testnet", False)
+    return get_current_network(testnet_flag=testnet)
+
+
+def require_keystore() -> dict:
+    data = load_keystore()
+    if not data:
+        log("No wallet found. Run: bin/moss-wallet init [--testnet]", "err")
+        sys.exit(1)
+    return data
+
+
+def decrypt_with_prompt(data: dict) -> str:
+    pw = get_passphrase("Enter wallet passphrase: ")
+    return decrypt_mnemonic(data, pw)
+
+
+def require_confirm(args: argparse.Namespace, action: str) -> None:
+    if getattr(args, "confirm", False) or getattr(args, "yes", False):
+        return
+    ans = input(f"Confirm {action}? [y/N] ").strip().lower()
+    if ans not in ("y", "yes"):
+        log("Aborted by user", "warn")
+        sys.exit(1)
+
+
+def print_addresses(addrs: dict, count: int = 5) -> None:
+    for atype in ("legacy", "segwit", "taproot"):
+        print(f"\n{atype.upper()}:")
+        for i, a in enumerate(addrs[atype][:count]):
+            print(f"  [{i}] {a}")
+
+
+# --------------------------- commands ---------------------------
+
+def cmd_status(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    present = is_keystore_present()
+    cfg = load_config()
+    print("\n=== moss-wallet status ===")
+    print(f"Wallet dir:     {WALLET_BASE}")
+    print(f"Keystore:       {'present' if present else 'MISSING'}")
+    print(f"Config:         network={cfg.get('network')}, last_index={cfg.get('last_receive_index')}")
+    print(f"Effective net:  {net}")
+    if present:
+        try:
+            data = require_keystore()
+            pw = get_passphrase("Enter passphrase to verify (or Ctrl-C): ")
+            mnemonic = decrypt_mnemonic(data, pw)
+            first = derive_address(mnemonic, 0, "segwit", net)
+            print(f"First segwit:   {first}")
+            print("Decrypt OK")
+        except Exception as e:
+            print(f"Decrypt check: FAILED ({e})")
+    write_audit("status", f"net={net}")
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if is_keystore_present():
+        log("Keystore already exists. Use restore or remove manually.", "err")
+        return 1
+
+    net = "testnet" if args.testnet else "mainnet"
+    mnemonic = generate_mnemonic()
+    print("\n=== NEW WALLET MNEMONIC (WRITE THIS DOWN NOW - 24 WORDS) ===\n")
+    print(mnemonic)
+    print("\n=== FIRST ADDRESSES (for verification) ===")
+    addrs = derive_first_addresses(mnemonic, 3, net)
+    print_addresses(addrs, 3)
+
+    print("\nThis mnemonic will be encrypted and NEVER stored in cleartext.")
+    passphrase = confirm_passphrase()
+
+    enc = encrypt_mnemonic(mnemonic, passphrase)
+    save_keystore(enc)
+    cfg = {"network": net, "last_receive_index": 0}
+    save_config(cfg)
+    write_audit("init", f"net={net}")
+
+    log(f"Wallet initialized ({net}). Keystore saved to {WALLET_BASE / 'keystore.enc'}", "ok")
+    log("Run 'bin/moss-wallet export-backup --confirm' to create a paper backup file.", "warn")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    if is_keystore_present():
+        log("Keystore exists. Aborting restore to avoid overwrite.", "err")
+        return 1
+
+    net = "testnet" if args.testnet else "mainnet"
+
+    if args.mnemonic:
+        mnemonic = args.mnemonic.strip()
+    else:
+        print("Paste 24-word mnemonic (BIP-39 english):")
+        mnemonic = input().strip()
+
+    if not validate_mnemonic(mnemonic):
+        log("Invalid mnemonic", "err")
+        return 1
+
+    print("Mnemonic OK. First addresses:")
+    addrs = derive_first_addresses(mnemonic, 3, net)
+    print_addresses(addrs, 3)
+
+    passphrase = confirm_passphrase()
+    enc = encrypt_mnemonic(mnemonic, passphrase)
+    save_keystore(enc)
+    cfg = {"network": net, "last_receive_index": 0}
+    save_config(cfg)
+    write_audit("restore", f"net={net}")
+
+    log("Wallet restored and encrypted.", "ok")
+    return 0
+
+
+def cmd_addresses(args: argparse.Namespace) -> int:
+    data = require_keystore()
+    mnemonic = decrypt_with_prompt(data)
+    net = get_effective_network(args)
+    atype = getattr(args, "type", "segwit") or "segwit"
+    count = getattr(args, "count", 5)
+
+    addrs = derive_first_addresses(mnemonic, count, net)
+    print(f"\n=== Addresses (network={net}, type filter={atype}) ===")
+    if atype in addrs:
+        for i, a in enumerate(addrs[atype][:count]):
+            print(f"  [{i}] {a}")
+    else:
+        print_addresses(addrs, count)
+
+    write_audit("addresses", f"net={net} type={atype} count={count}")
+    return 0
+
+
+def cmd_balance(args: argparse.Namespace) -> int:
+    data = require_keystore()
+    mnemonic = decrypt_with_prompt(data)
+    net = get_effective_network(args)
+    atype = getattr(args, "type", "segwit") or "segwit"
+    count = 10  # scan more for balance
+
+    addrs = derive_first_addresses(mnemonic, count, net)[atype]
+    log(f"Fetching balance for first {len(addrs)} {atype} addresses...", "step")
+
+    bals = {}
+    total_sats = 0
+    for a in addrs:
+        try:
+            b = fetch_balance(a, net)
+            bals[a] = b
+            total_sats += b
+            if b > 0:
+                log(f"{a}: {sats_to_btc(b):.8f} BTC", "info")
+        except Exception as e:
+            log(f"Error fetching {a}: {e}", "warn")
+
+    print(f"\n=== Balance (network={net}) ===")
+    print(f"Total: {sats_to_btc(total_sats):.8f} BTC ({total_sats} sats)")
+    print(f"Addresses scanned: {len(addrs)}")
+    write_audit("balance", f"net={net} total_sats={total_sats}")
+    return 0
+
+
+def cmd_receive(args: argparse.Namespace) -> int:
+    data = require_keystore()
+    mnemonic = decrypt_with_prompt(data)
+    net = get_effective_network(args)
+    atype = getattr(args, "type", "segwit") or "segwit"
+
+    idx = bump_receive_index()
+    addr = derive_address(mnemonic, idx, atype, net)
+    print(f"\nFresh {atype} receive address (index {idx}, net {net}):")
+    print(f"  {addr}")
+    write_audit("receive", f"net={net} type={atype} index={idx}")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    to_addr = args.to
+    amount = float(args.amount)
+    fee_rate = float(args.fee_rate)
+    psbt_file = getattr(args, "psbt_file", None)
+
+    if not validate_address(to_addr, get_effective_network(args)):
+        log(f"Invalid destination address: {to_addr}", "err")
+        return 1
+
+    data = require_keystore()
+    mnemonic = decrypt_with_prompt(data)
+    net = get_effective_network(args)
+
+    # Derive addresses for UTXO scan + change
+    addrs_dict = derive_first_addresses(mnemonic, 15, net)
+    # prefer segwit for inputs/change
+    my_addrs = addrs_dict.get("segwit", []) + addrs_dict.get("taproot", []) + addrs_dict.get("legacy", [])
+
+    log("Fetching UTXOs...", "step")
+    all_utxos: list[dict] = []
+    for a in my_addrs:
+        try:
+            uts = fetch_utxos(a, net)
+            for u in uts:
+                u["address"] = a  # annotate
+            all_utxos.extend(uts)
+        except Exception:
+            pass
+
+    if not all_utxos:
+        log("No UTXOs found. Fund the wallet first.", "err")
+        return 1
+
+    # choose change address (next after current last)
+    change_idx = load_config().get("last_receive_index", 0) + 1
+    change_addr = derive_address(mnemonic, change_idx, "segwit", net)
+
+    require_confirm(args, f"build PSBT sending {amount} BTC to {to_addr}")
+
+    log("Building unsigned PSBT...", "step")
+    try:
+        psbt_b64 = build_unsigned_psbt(
+            all_utxos, to_addr, amount, fee_rate, change_addr, net
+        )
+    except Exception as e:
+        log(f"PSBT build failed: {e}", "err")
+        return 1
+
+    print("\n=== UNSIGNED PSBT (base64) ===")
+    print(psbt_b64)
+    if psbt_file:
+        Path(psbt_file).write_text(psbt_b64)
+        log(f"PSBT written to {psbt_file}", "ok")
+
+    print("\nCopy the PSBT above. Sign offline or with your preferred tool.")
+    print("This CLI does NOT broadcast.")
+    write_audit("send", f"net={net} to={to_addr} amount={amount} fee_rate={fee_rate}")
+    return 0
+
+
+def cmd_export_backup(args: argparse.Namespace) -> int:
+    output = getattr(args, "output", None)
+    data = require_keystore()
+    mnemonic = decrypt_with_prompt(data)
+    net = get_current_network()
+
+    require_confirm(args, "export mnemonic + addresses to backup file")
+
+    addrs = derive_first_addresses(mnemonic, 3, net)
+
+    content = []
+    content.append("MOSSWALLET PAPER BACKUP")
+    content.append(f"Network: {net}")
+    content.append(f"Created: {load_config().get('created_at', 'unknown')}")
+    content.append("")
+    content.append("MNEMONIC (24 words):")
+    content.append(mnemonic)
+    content.append("")
+    content.append("VERIFY ADDRESSES:")
+    for typ, lst in addrs.items():
+        content.append(f"{typ}: {lst[0]}")
+    content.append("")
+    content.append("KEEP THIS SECURE. DELETE AFTER PRINTING.")
+    text = "\n".join(content)
+
+    if output:
+        p = Path(output)
+        p.write_text(text)
+        p.chmod(0o600)
+        log(f"Backup written to {p}. Print it, then securely delete.", "warn")
+    else:
+        print(text)
+
+    write_audit("export-backup", f"net={net}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="moss-wallet",
+        description="Self-custody Bitcoin HD wallet (encrypted, PSBT only)",
+    )
+
+    # Common parent for flags that work before or after subcommand
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--testnet", action="store_true", help="Use testnet (overrides config)")
+    common.add_argument("--confirm", "--yes", "-y", dest="confirm", action="store_true",
+                        help="Skip interactive confirmation for destructive ops")
+
+    # Also register on top parser so --testnet status works (flag before subcommand)
+    parser.add_argument("--testnet", action="store_true", help="Use testnet (overrides config)")
+    parser.add_argument("--confirm", "--yes", "-y", dest="confirm", action="store_true",
+                        help="Skip interactive confirmation for destructive ops")
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", parents=[common], help="Show wallet health")
+    p_status.set_defaults(func=cmd_status)
+
+    p_init = sub.add_parser("init", parents=[common], help="Generate new wallet + encrypt")
+    p_init.set_defaults(func=cmd_init)
+
+    p_restore = sub.add_parser("restore", parents=[common], help="Restore from mnemonic")
+    p_restore.add_argument("--mnemonic", help="Mnemonic words (avoid in shell history if possible)")
+    p_restore.set_defaults(func=cmd_restore)
+
+    p_addr = sub.add_parser("addresses", parents=[common], help="List receive addresses")
+    p_addr.add_argument("--type", choices=["legacy", "segwit", "taproot"], default="segwit")
+    p_addr.add_argument("--count", type=int, default=5)
+    p_addr.set_defaults(func=cmd_addresses)
+
+    p_bal = sub.add_parser("balance", parents=[common], help="Check balance (scans addresses)")
+    p_bal.add_argument("--type", choices=["legacy", "segwit", "taproot"], default="segwit")
+    p_bal.set_defaults(func=cmd_balance)
+
+    p_recv = sub.add_parser("receive", parents=[common], help="Show a fresh receive address")
+    p_recv.add_argument("--type", choices=["legacy", "segwit", "taproot"], default="segwit")
+    p_recv.set_defaults(func=cmd_receive)
+
+    p_send = sub.add_parser("send", parents=[common], help="Build unsigned PSBT (no broadcast)")
+    p_send.add_argument("--to", required=True, help="Destination address")
+    p_send.add_argument("--amount", required=True, type=float, help="Amount in BTC")
+    p_send.add_argument("--fee-rate", required=True, type=float, help="Fee rate sat/vB")
+    p_send.add_argument("--psbt-file", help="Write PSBT to this file")
+    p_send.set_defaults(func=cmd_send)
+
+    p_exp = sub.add_parser("export-backup", parents=[common], help="Export mnemonic + addresses (paper backup)")
+    p_exp.add_argument("--output", "-o", help="Write to file instead of stdout")
+    p_exp.set_defaults(func=cmd_export_backup)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        return 130
+    except Exception as e:
+        log(f"Error: {e}", "err")
+        if os.environ.get("DEBUG"):
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
