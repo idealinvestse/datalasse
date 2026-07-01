@@ -1,5 +1,17 @@
-<!-- Heartbeat template; comments-only content prevents scheduled heartbeat API calls. -->
+# Heartbeat checklist (natt-shift 2026-07-01)
 
-# Keep this file empty (or with only comments) to skip heartbeat API calls.
+## Aktiva uppgifter
+- [ ] VPS health snapshot
+- [ ] MEMORY.md konsolidering (dagens lärdomar)
+- [ ] Git commit (dagens alla ändringar)
+- [ ] Mailcow backup-script (cron-hourly)
+- [ ] Skill-audit + saknade tester
+- [ ] Deep research: autonomous agents
+- [ ] Workspace INDEX.md
+- [ ] Cleanup: tmp + gamla loggar
+- [ ] Summering till Oscar kl 07:00
 
-# Add tasks below when you want the agent to check something periodically.
+## Inaktiva (paused)
+- Devin live-användning: väntar på riktiga credentials
+- Wolt-mail follow-up: Mailgun events = 0 (mailet kom aldrig)
+- MX-varning follow-up: kosmetiskt, mail levereras korrekt
