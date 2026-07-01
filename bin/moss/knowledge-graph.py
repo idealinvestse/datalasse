@@ -12,7 +12,7 @@ Usage:
   knowledge-graph.py stats                                    # count by type
   knowledge-graph.py forget <id>                               # delete by id
 
-Storage: /root/.openclaw/workspace/.moss-private/knowledge/
+Storage: /root/.moss-private/knowledge/
 Schema: id, type, text, metadata (json), ts
 
 Types: decision, lesson, contact, project, code-ref, preference, fact
@@ -24,7 +24,7 @@ import sys
 import time
 from pathlib import Path
 
-CHROMA_PATH = "/root/.openclaw/workspace/.moss-private/knowledge"
+CHROMA_PATH = "/root/.moss-private/knowledge"
 COLLECTION = "moss_memories"
 STATE_FILE = "/root/.openclaw/workspace/moss-state.json"
 

@@ -124,3 +124,6 @@ Thumbs.db
 # (these are matched by docs/, examples/, skills/ but the patterns
 # above could otherwise be too greedy — leave the rest to git)
 .backups/
+
+# Moss private (outside the security boundary — never commit)
+.moss-private/

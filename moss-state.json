@@ -264,6 +264,48 @@
         "type": "contact",
         "ts": "2026-07-01T15:32:26Z",
         "preview": "Paulina (8419098743) — Oscars partner, weight-conscious, warm emoji-style 🌸"
+      },
+      {
+        "id": "decision-1782920048788",
+        "type": "decision",
+        "ts": "2026-07-01T15:34:08Z",
+        "preview": "Grok-build max-turns ska vara 40 som default, env-var GROK_MAX_TURNS för overrid"
+      },
+      {
+        "id": "lesson-1782920050031",
+        "type": "lesson",
+        "ts": "2026-07-01T15:34:09Z",
+        "preview": "Telegram Markdown parser är strict — asterisker inuti backticks tolkas som forma"
+      },
+      {
+        "id": "contact-1782920051428",
+        "type": "contact",
+        "ts": "2026-07-01T15:34:10Z",
+        "preview": "Paulina (8419098743) — Oscars partner, weight-conscious, warm emoji-style"
+      },
+      {
+        "id": "decision-1782920067389",
+        "type": "decision",
+        "ts": "2026-07-01T15:34:26Z",
+        "preview": "Grok-build max-turns default 40, env-vars GROK_MAX_TURNS + GROK_EFFORT"
+      },
+      {
+        "id": "lesson-1782920068783",
+        "type": "lesson",
+        "ts": "2026-07-01T15:34:27Z",
+        "preview": "Telegram Markdown strict parser — asterisker inuti backticks tolkas som formatti"
+      },
+      {
+        "id": "contact-1782920070222",
+        "type": "contact",
+        "ts": "2026-07-01T15:34:29Z",
+        "preview": "Paulina (8419098743) — Oscars partner, weight-conscious, warm emoji-style"
+      },
+      {
+        "id": "project-1782920071508",
+        "type": "project",
+        "ts": "2026-07-01T15:34:30Z",
+        "preview": "Moss Architecture 2.0 — M0 done (identity+state+tools), M1 scaffold (knowledge g"
       }
     ],
     "stats": {}
