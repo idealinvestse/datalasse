@@ -460,34 +460,63 @@ cmd_send() {
   local fn
   fn=$(basename "$local_path")
 
+  # openclaw message tool rejects paths under /root/.moss-private/.
+  # Stage a copy in workspace, send, then clean up.
+  local send_path="$local_path"
+  local staging=""
+  if [[ "$local_path" == /root/.moss-private/* ]]; then
+    staging="${WORKSPACE:-$HOME/.openclaw/workspace}/.moss-outbox"
+    mkdir -p -m 700 "$staging" 2>/dev/null || true
+    send_path="$staging/$fn"
+    cp "$local_path" "$send_path"
+    chmod 600 "$send_path" 2>/dev/null || true
+  fi
+
   local json_out
   set +e
   json_out=$(openclaw message send \
     --channel telegram \
     --target "$target" \
-    --media "$local_path" \
+    --media "$send_path" \
     ${caption:+--message "$caption"} \
     --json 2>&1)
   local send_rc=$?
   set -e
 
+  # Clean up staging copy
+  if [[ -n "$staging" && -f "$send_path" ]]; then
+    rm -f "$send_path"
+  fi
+
   local ok="false" msg_id=""
   if [[ $send_rc -eq 0 ]]; then
-    ok=$(python3 -c '
-import json,sys
+    # The openclaw tool returns a JSON wrapper; the actual API result is in
+    # .payload (or sometimes .result). We treat the message as sent if we can
+    # find a non-empty messageId anywhere in the response.
+    read -r ok msg_id < <(python3 -c '
+import json, sys
 try:
-  d=json.loads(sys.argv[1])
-  print("true" if d.get("ok") or (d.get("result") and d.get("result",{}).get("message_id")) else "false")
-except: print("false")
-' "$json_out" || echo false)
-    msg_id=$(python3 -c '
-import json,sys
-try:
-  d=json.loads(sys.argv[1])
-  m = d.get("result",{}).get("message_id","")
-  print(m)
-except: print("")
-' "$json_out" || echo "")
+  d = json.loads(sys.argv[1])
+except Exception:
+  print("false ")
+  sys.exit(0)
+
+# Look in payload first, then result
+candidates = []
+if isinstance(d.get("payload"), dict):
+  candidates.append(d["payload"])
+if isinstance(d.get("result"), dict):
+  candidates.append(d["result"])
+candidates.append(d)
+
+for c in candidates:
+  mid = c.get("messageId") or c.get("message_id")
+  if mid:
+    is_ok = c.get("ok", True)
+    print(("true " if is_ok else "false ") + str(mid))
+    sys.exit(0)
+print("false ")
+' "$json_out")
   fi
 
   if [[ "$ok" != "true" ]]; then

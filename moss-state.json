@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0.0",
-  "last_updated": "2026-07-01T16:27:21Z",
+  "last_updated": "2026-07-01T16:37:02Z",
   "session_id": "main-2026-07-01-1400",
   "updated_by": "Moss (self-initiated, during free-creative block 14:05-17:00)",
   "active_goals": [
@@ -223,21 +223,35 @@
           "size_bytes": 113483,
           "received_from": "438805461 (oscar)",
           "received_at": "2026-07-01T16:27:21Z",
-          "shared_with": [],
+          "shared_with": [
+            "8419098743 (paulina)"
+          ],
           "context": "Oscars kvällsmat 18:25, hemlagad med Felix Chipotle + Caesar + rosé",
           "captions": [
             "middag med sallad och kyckling"
           ],
-          "delivery_log": [],
+          "delivery_log": [
+            {
+              "ts": "2026-07-01T18:34:00Z",
+              "target": "8419098743 (paulina)",
+              "channel": "telegram",
+              "telegram_message_id": 6039,
+              "caption": "Middag Oscar njöt av ❤️",
+              "relay_message": "Hej Paulina! 🌸 Här är bilden Oscar tog av middagen — han ville att jag skulle säga att han älskar dig och tacka för maten ❤️🍷",
+              "status": "delivered"
+            }
+          ],
           "original_caption": "Kolla hur nice maten blev",
           "source": "openclaw_inbound",
           "aliases": [
             "local-24613744c1295152a84bc8c19da62d03d55ab697277a5ed4777c81",
             "media://inbound/7df17b80-b0f5-433a-9021-e215d9f4c5a9.jpg"
-          ]
+          ],
+          "last_shared_with": "8419098743",
+          "last_delivery_ts": "2026-07-01T16:37:02Z"
         }
       ],
-      "last_updated": "2026-07-01T18:26:00Z"
+      "last_updated": "2026-07-01T18:34:00Z"
     },
     "people_notes": {
       "Paulina": {
@@ -344,6 +358,12 @@
         "type": "lesson",
         "ts": "2026-07-01T16:29:51Z",
         "preview": "Läs ALLTID user caption i meddelande, inte bara bild-beskrivning. 2026-07-01 18:"
+      },
+      {
+        "id": "lesson-1782923722610",
+        "type": "lesson",
+        "ts": "2026-07-01T16:35:21Z",
+        "preview": "openclaw message tool tillåter INTE media-path under /root/.moss-private/ (secur"
       }
     ],
     "stats": {}
