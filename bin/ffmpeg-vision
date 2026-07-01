@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""ffmpeg-vision: CLI för adaptiv frame-extraktion + vision-LLM-beskrivning.
+
+Underkommandon:
+  extract   - extrahera frames vid timestamps eller jämnt intervall
+  adaptive  - adaptiv sampling baserat på transcript
+  describe  - beskriv frames i en mapp med vision-LLM
+  info      - visa video-metadata
+  models    - lista tillgängliga vision-modeller
+  cost      - uppskatta kostnad för N frames
+
+Exempel:
+  ffmpeg-vision info episode.mp4
+  ffmpeg-vision extract episode.mp4 --interval 30 --output frames/
+  ffmpeg-vision adaptive episode.mp4 --transcript data/kill-tony/transcripts/ep-774.transcript.json --max-frames 30
+  ffmpeg-vision describe frames/ --model llama-4-scout-groq --output frames/descriptions.json
+  ffmpeg-vision cost 50 --model llama-4-scout-groq
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Workspace-aware imports
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE))
+
+from skills.ffmpeg_vision import (
+    FrameExtractor,
+    extract_frames_at_timestamps,
+    get_video_metadata,
+    sample_adaptive_timestamps,
+    describe_frames,
+    MODELS,
+)
+from skills.ffmpeg_vision.vision import estimate_cost, VisionDescriber
+from skills.ffmpeg_vision.sampler import TranscriptTimeline, AdaptiveSampler
+
+
+def log(msg: str, level: str = "info") -> None:
+    icon = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}.get(level, "·")
+    print(f"{icon} {msg}", flush=True)
+
+
+def cmd_info(args: argparse.Namespace) -> int:
+    meta = get_video_metadata(args.video)
+    print(f"\n=== Video info ===\n")
+    print(f"Path:           {meta.path}")
+    print(f"Duration:       {meta.duration_seconds:.1f}s ({meta.duration_seconds / 60:.1f} min)")
+    print(f"Resolution:     {meta.width}x{meta.height} ({meta.aspect_ratio()})")
+    print(f"FPS:            {meta.fps:.2f}")
+    print(f"Codec:          {meta.codec}")
+    print(f"Bit rate:       {meta.bit_rate // 1000} kbps")
+    print(f"Size:           {meta.size_bytes / 1024 / 1024:.1f} MB")
+    print(f"Has audio:      {meta.has_audio}")
+    return 0
+
+
+def cmd_extract(args: argparse.Namespace) -> int:
+    """Extrahera frames med jämnt intervall eller specifika timestamps."""
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    extractor = FrameExtractor(
+        video_path=args.video,
+        output_dir=output_dir,
+        image_format=args.format,
+        image_quality=args.quality,
+        target_width=args.width,
+    )
+    if args.timestamps:
+        # Parse "MM:SS" eller rena sekunder
+        ts = []
+        for t in args.timestamps.split(","):
+            t = t.strip()
+            if ":" in t:
+                parts = [int(p) for p in t.split(":")]
+                if len(parts) == 2:
+                    ts.append(parts[0] * 60 + parts[1])
+                else:
+                    ts.append(parts[0] * 3600 + parts[1] * 60 + parts[2])
+            else:
+                ts.append(float(t))
+        log(f"Extraherar {len(ts)} frames vid specifika timestamps", "step")
+        results = extractor.extract_many(ts)
+    else:
+        log(f"Extraherar frames var {args.interval}s (max {args.max_frames})", "step")
+        results = extractor.extract_interval(args.interval, max_frames=args.max_frames)
+    log(f"Extraherade {len(results)} frames → {output_dir}", "ok")
+    # Spara manifest
+    manifest = {
+        "video": str(args.video),
+        "extracted_count": len(results),
+        "frames": [
+            {"timestamp": r.timestamp, "path": str(r.path), "width": r.width, "height": r.height}
+            for r in results
+        ],
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return 0
+
+
+def cmd_adaptive(args: argparse.Namespace) -> int:
+    """Adaptiv sampling baserat på transcript + ev. analys."""
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Bygger tidslinje från {args.transcript}", "step")
+    analysis_json = args.analysis
+    timeline = TranscriptTimeline.from_files(args.transcript, analysis_json)
+    sampler = AdaptiveSampler(
+        timeline=timeline,
+        base_interval=args.base_interval,
+        min_interval=args.min_interval,
+        max_frames=args.max_frames,
+    )
+    candidates = sampler.sample()
+    log(f"Adaptiv sampling: {len(candidates)} timestamps", "ok")
+    # Visa fördelning
+    by_reason = {}
+    for c in candidates:
+        reason = c["reason"].split(":")[0]
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+    for reason, count in sorted(by_reason.items(), key=lambda x: -x[1]):
+        log(f"  · {reason}: {count}", "info")
+    # Extrahera
+    extractor = FrameExtractor(
+        video_path=args.video,
+        output_dir=output_dir,
+        image_format=args.format,
+        image_quality=args.quality,
+        target_width=args.width,
+    )
+    timestamps = [c["timestamp"] for c in candidates]
+    results = extractor.extract_many(timestamps)
+    # Annotera med reasons
+    reasons_by_ts = {c["timestamp"]: c["reason"] for c in candidates}
+    for r in results:
+        r.reason = reasons_by_ts.get(r.timestamp, "?")  # type: ignore
+    # Spara manifest
+    manifest = {
+        "video": str(args.video),
+        "transcript": str(args.transcript),
+        "analysis": str(analysis_json) if analysis_json else None,
+        "sampling_strategy": "adaptive",
+        "base_interval": args.base_interval,
+        "min_interval": args.min_interval,
+        "max_frames": args.max_frames,
+        "extracted_count": len(results),
+        "frames": [
+            {"timestamp": r.timestamp, "path": str(r.path), "reason": getattr(r, "reason", "?")}
+            for r in results
+        ],
+        "stats": by_reason,
+    }
+    (output_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    log(f"Manifest: {output_dir / 'manifest.json'}", "ok")
+    return 0
+
+
+def cmd_describe(args: argparse.Namespace) -> int:
+    """Beskriv frames i en mapp med vision-LLM."""
+    frames_dir = Path(args.frames_dir)
+    if not frames_dir.is_dir():
+        log(f"Katalogen finns inte: {frames_dir}", "err")
+        return 1
+    frames = sorted(frames_dir.glob(f"*.{args.format}"))
+    if not frames:
+        # Försök hitta alla bilder
+        frames = sorted(p for p in frames_dir.iterdir() if p.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
+    if not frames:
+        log(f"Inga frames hittades i {frames_dir}", "err")
+        return 1
+    log(f"Hittade {len(frames)} frames", "info")
+    # Uppskatta kostnad
+    cost_estimate = estimate_cost(args.model, min(len(frames), args.max_frames), prompt_tokens=200, output_tokens=args.max_tokens)
+    log(f"Uppskattad kostnad ({args.model}): ${cost_estimate:.4f}", "info")
+    if args.budget and cost_estimate > args.budget:
+        log(f"⚠️ Kostnad ${cost_estimate:.4f} över budget ${args.budget:.4f}", "warn")
+        if not args.yes:
+            ans = input("Fortsätta ändå? [y/N] ")
+            if ans.lower() != "y":
+                return 1
+    log(f"Beskriver frames med {args.model}...", "step")
+    descs = describe_frames(
+        frames,
+        model_key=args.model,
+        prompt_template=args.prompt,
+        max_frames=args.max_frames,
+    )
+    # Sätt timestamps från manifest om det finns
+    manifest_path = frames_dir / "manifest.json"
+    ts_by_path = {}
+    if manifest_path.exists():
+        m = json.loads(manifest_path.read_text())
+        for f in m.get("frames", []):
+            ts_by_path[f["path"]] = f.get("timestamp", 0)
+    for d in descs:
+        d.timestamp = ts_by_path.get(str(d.frame_path), 0)
+    # Spara resultat
+    output_path = Path(args.output)
+    output_data = {
+        "frames_dir": str(frames_dir),
+        "model": args.model,
+        "count": len(descs),
+        "estimated_cost_usd": cost_estimate,
+        "descriptions": [
+            {
+                "frame_path": str(d.frame_path),
+                "timestamp": d.timestamp,
+                "description": d.description,
+                "model": d.model,
+                "cost_usd": d.cost_usd,
+            }
+            for d in descs
+        ],
+    }
+    output_path.write_text(json.dumps(output_data, indent=2, ensure_ascii=False))
+    total_cost = sum(d.cost_usd for d in descs)
+    log(f"Beskrivningar sparade: {output_path}", "ok")
+    log(f"Totalkostnad: ${total_cost:.4f}", "ok")
+    return 0
+
+
+def cmd_models(args: argparse.Namespace) -> int:
+    """Lista tillgängliga vision-modeller."""
+    print(f"\n=== Tillgängliga vision-modeller ===\n")
+    for key, m in MODELS.items():
+        cost_per_100 = estimate_cost(key, 100, prompt_tokens=200, output_tokens=200)
+        print(f"  {key}")
+        print(f"    {m.name} ({m.provider})")
+        print(f"    ${m.cost_input_per_million}/1M input, ${m.cost_output_per_million}/1M output")
+        print(f"    ~${cost_per_100:.4f} per 100 frames")
+        print(f"    {m.description}\n")
+    return 0
+
+
+def cmd_cost(args: argparse.Namespace) -> int:
+    """Uppskatta kostnad för N frames."""
+    cost = estimate_cost(args.model, args.num_frames, prompt_tokens=200, output_tokens=args.max_tokens)
+    print(f"\nModell: {args.model}")
+    print(f"Frames: {args.num_frames}")
+    print(f"Uppskattad kostnad: ${cost:.4f}\n")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="ffmpeg-vision", description="Adaptiv frame-extraktion + vision-LLM")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    p_info = sub.add_parser("info", help="visa video-metadata")
+    p_info.add_argument("video")
+    p_extract = sub.add_parser("extract", help="extrahera frames (jämnt intervall eller timestamps)")
+    p_extract.add_argument("video")
+    p_extract.add_argument("--output", "-o", default="./frames", help="output-katalog")
+    p_extract.add_argument("--interval", type=float, default=30.0, help="sekunder mellan frames (default 30)")
+    p_extract.add_argument("--timestamps", help="komma-separerade timestamps (MM:SS eller sekunder)")
+    p_extract.add_argument("--max-frames", type=int, default=100, help="max antal frames")
+    p_extract.add_argument("--format", default="jpg", help="jpg, png, webp")
+    p_extract.add_argument("--quality", type=int, default=2, help="ffmpeg quality (1=best, 31=worst)")
+    p_extract.add_argument("--width", type=int, default=0, help="target width (0=original)")
+    p_adaptive = sub.add_parser("adaptive", help="adaptiv sampling baserat på transcript")
+    p_adaptive.add_argument("video")
+    p_adaptive.add_argument("--transcript", "-t", required=True, help="path till transcript.json")
+    p_adaptive.add_argument("--analysis", "-a", help="path till analys-JSON (optional)")
+    p_adaptive.add_argument("--output", "-o", default="./frames", help="output-katalog")
+    p_adaptive.add_argument("--base-interval", type=float, default=30.0, help="default intervall (s)")
+    p_adaptive.add_argument("--min-interval", type=float, default=5.0, help="minsta gap (s)")
+    p_adaptive.add_argument("--max-frames", type=int, default=50)
+    p_adaptive.add_argument("--format", default="jpg")
+    p_adaptive.add_argument("--quality", type=int, default=2)
+    p_adaptive.add_argument("--width", type=int, default=0)
+    p_describe = sub.add_parser("describe", help="beskriv frames med vision-LLM")
+    p_describe.add_argument("frames_dir", help="katalog med frames")
+    p_describe.add_argument("--model", default="llama-4-scout-groq", help="modell (se 'models')")
+    p_describe.add_argument("--output", "-o", default="descriptions.json")
+    p_describe.add_argument("--max-frames", type=int, default=50)
+    p_describe.add_argument("--max-tokens", type=int, default=200, help="max output tokens per frame")
+    p_describe.add_argument("--prompt", help="custom prompt template")
+    p_describe.add_argument("--format", default="jpg", help="filformat att söka efter")
+    p_describe.add_argument("--budget", type=float, default=0, help="max kostnad USD (0=ingen gräns)")
+    p_describe.add_argument("--yes", "-y", action="store_true", help="skip budget-bekräftelse")
+    p_models = sub.add_parser("models", help="lista vision-modeller")
+    p_cost = sub.add_parser("cost", help="uppskatta kostnad")
+    p_cost.add_argument("num_frames", type=int)
+    p_cost.add_argument("--model", default="llama-4-scout-groq")
+    p_cost.add_argument("--max-tokens", type=int, default=200)
+    args = parser.parse_args()
+    handlers = {
+        "info": cmd_info, "extract": cmd_extract, "adaptive": cmd_adaptive,
+        "describe": cmd_describe, "models": cmd_models, "cost": cmd_cost,
+    }
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
