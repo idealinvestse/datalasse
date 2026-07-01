@@ -9,8 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
 # shellcheck source=lib/research-state.sh
-source "$SCRIPT_DIR/lib/research-state.sh"
+source "$LIB_DIR/research-state.sh"
 
 CMD=""
 RUN_ID=""

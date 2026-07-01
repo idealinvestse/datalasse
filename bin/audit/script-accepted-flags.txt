@@ -3,7 +3,7 @@ deep-research|--depth --budget --goal --recipe --synth-model --output --output-s
 deep-research-test|--help
 exa-contents|--file --highlights --max-age --text-max
 exa-research|--model --output-schema --wait --fire-and-forget --pretty
-exa-search|--count --type --json
+exa-search|--count --type --json --num --output-schema --system-prompt
 fal-safety-audit|--dry-run --force-recheck --json
 fal-safety-reset|--dry --json
 github-watchdog|

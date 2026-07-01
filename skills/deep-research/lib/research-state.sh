@@ -3,7 +3,16 @@
 
 _LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 _BIN_DIR="$(dirname "$_LIB_DIR")"
-WORKSPACE_DIR="${WORKSPACE_DIR:-$(cd "$_BIN_DIR/.." && pwd)}"
+# support original (bin/lib) and consolidated (skills/deep-research/lib) layout
+if [ -n "${WORKSPACE_DIR:-}" ]; then
+  : # caller override
+else
+  cand=$(cd "$(dirname "$_LIB_DIR")/../.." 2>/dev/null && pwd)
+  if [ -z "$cand" ] || [ ! -d "$cand/bin" -a ! -d "$cand/skills" ]; then
+    cand=$(cd "$_BIN_DIR/.." 2>/dev/null && pwd)
+  fi
+  WORKSPACE_DIR="$cand"
+fi
 
 RESEARCH_DIR="${RESEARCH_DIR:-${HOME}/.config/moss/research}"
 GOALS_FILE="$RESEARCH_DIR/goals.jsonl"

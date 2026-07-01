@@ -9,6 +9,11 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# robust for test copies (sibling lib or ../lib)
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+for cand in "$SCRIPT_DIR/lib" "$SCRIPT_DIR/../lib" "$(dirname "$SCRIPT_DIR")/lib" ; do
+  if [ -f "$cand/fallback.sh" ]; then LIB_DIR="$cand"; break; fi
+done
 CACHE_DB="${CACHE_DB:-${HOME}/.config/moss/research-cache.sqlite}"
 TTL="24h"
 TYPE="auto"
@@ -17,7 +22,7 @@ QUERY=""
 MODE="search"
 
 # shellcheck source=lib/fallback.sh
-source "$SCRIPT_DIR/lib/fallback.sh"
+source "$LIB_DIR/fallback.sh"
 
 parse_ttl_seconds() {
   local ttl="$1"

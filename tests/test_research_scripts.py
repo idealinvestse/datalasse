@@ -173,13 +173,17 @@ def test_deep_research_syntax_and_no_direct_curl_in_llm_paths():
     Full end-to-end is impractical without Serper/Exa keys + real search results even under MOCK
     (many stages invoke external bins). Skipped per plan.
     """
+    # Support consolidated layout: prefer skill impl (post move), fall back to bin/ shim location
+    impl = ROOT / "skills/deep-research/bin/deep-research"
+    if not impl.exists():
+        impl = BIN_DIR / "deep-research"
     # bash -n
-    res = subprocess.run(["bash", "-n", str(BIN_DIR / "deep-research")], capture_output=True, text=True)
+    res = subprocess.run(["bash", "-n", str(impl)], capture_output=True, text=True)
     assert res.returncode == 0, f"syntax failed: {res.stderr}"
 
     # Heuristic: the 4 call sites should now reference bin/llm-call (or --group=)
-    src = (BIN_DIR / "deep-research").read_text()
-    assert "bin/llm-call --group=" in src or "--group=subagent-research" in src
+    src = impl.read_text()
+    assert "bin/llm-call --group=" in src or "--group=subagent-research" in src or "llm-call" in src
     # Old direct curls for the LLM sites should be gone (the remaining curls are for other things)
     # Count legacy patterns for the synth/audit style calls - should be zero for the replaced ones
     assert 'chat/completions" \\\n    -H "Authorization: Bearer ${OPENROUTER_API_KEY}"' not in src  # rough

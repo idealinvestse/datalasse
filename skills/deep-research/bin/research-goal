@@ -13,8 +13,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# robust for test copies where script + lib/ are siblings in TESTBIN
+LIB_DIR="$(dirname "$SCRIPT_DIR")/lib"
+for cand in "$SCRIPT_DIR/lib" "$SCRIPT_DIR/../lib" "$(dirname "$SCRIPT_DIR")/lib" ; do
+  if [ -f "$cand/research-state.sh" ]; then LIB_DIR="$cand"; break; fi
+done
 # shellcheck source=lib/research-state.sh
-source "$SCRIPT_DIR/lib/research-state.sh"
+source "$LIB_DIR/research-state.sh"
 
 CMD=""
 GOAL_ID=""

@@ -8,7 +8,8 @@ trap 'rm -rf "$TMP"' EXIT
 
 TESTBIN="$TMP/testbin"
 mkdir -p "$TESTBIN/lib"
-cp "$ROOT_DIR/lib/retry.sh" "$ROOT_DIR/lib/fallback.sh" "$TESTBIN/lib/"
+WSROOT="$(dirname "$ROOT_DIR")"
+cp "$WSROOT/skills/deep-research/lib/retry.sh" "$WSROOT/skills/deep-research/lib/fallback.sh" "$TESTBIN/lib/"
 
 SERPER_LOG="$TMP/serper-calls.log"
 touch "$SERPER_LOG"

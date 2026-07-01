@@ -8,8 +8,9 @@ trap 'rm -rf "$TMP"' EXIT
 
 TESTBIN="$TMP/testbin"
 mkdir -p "$TESTBIN/lib"
-cp "$ROOT_DIR/lib/retry.sh" "$ROOT_DIR/lib/fallback.sh" "$TESTBIN/lib/"
-cp "$ROOT_DIR/cache-research" "$TESTBIN/"
+WSROOT="$(dirname "$ROOT_DIR")"
+cp "$WSROOT/skills/deep-research/lib/retry.sh" "$WSROOT/skills/deep-research/lib/fallback.sh" "$TESTBIN/lib/"
+cp "$WSROOT/skills/deep-research/bin/cache-research" "$TESTBIN/"
 chmod +x "$TESTBIN/cache-research"
 
 cat > "$TESTBIN/exa-search" << 'MEXA'

@@ -7,7 +7,7 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 # shellcheck source=../lib/retry.sh
-source "$ROOT_DIR/lib/retry.sh"
+WSROOT="$(dirname "$ROOT_DIR")"; source "$WSROOT/skills/deep-research/lib/retry.sh"
 
 # Mock: fails N times then succeeds
 cat > "$TMP/flaky-cmd" << 'MOCK'

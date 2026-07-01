@@ -9,10 +9,11 @@ trap 'rm -rf "$TMP"' EXIT
 TESTBIN="$TMP/testbin"
 mkdir -p "$TESTBIN"
 
-# Copy real deep-research + lib modules
-cp "$ROOT_DIR/deep-research" "$TESTBIN/deep-research"
+# Copy real deep-research + lib modules (from consolidated skill)
+WSROOT="$(dirname "$ROOT_DIR")"
+cp "$WSROOT/skills/deep-research/bin/deep-research" "$TESTBIN/deep-research"
 mkdir -p "$TESTBIN/lib"
-cp "$ROOT_DIR/lib/retry.sh" "$ROOT_DIR/lib/fallback.sh" "$TESTBIN/lib/"
+cp "$WSROOT/skills/deep-research/lib/retry.sh" "$WSROOT/skills/deep-research/lib/fallback.sh" "$TESTBIN/lib/"
 chmod +x "$TESTBIN/deep-research"
 
 # Mock exa-search (stdout json + cost controllable)
@@ -37,6 +38,25 @@ echo '[{"query":"mock deep sub","type":"deep","max_results":3,"rationale":"test"
 MDECOMP
 chmod +x "$TESTBIN/research-decompose"
 
+# Dummies for source-score + report-template (used unconditionally in deep-research)
+cat > "$TESTBIN/source-score" << 'MSCORE'
+#!/usr/bin/env bash
+echo '{"credibility":3,"reasoning":"mock"}'
+MSCORE
+chmod +x "$TESTBIN/source-score"
+
+cat > "$TESTBIN/report-template" << 'MTPL'
+#!/usr/bin/env bash
+echo '## Findings\n## Sources\n## Confidence Audit'
+MTPL
+chmod +x "$TESTBIN/report-template"
+
+cat > "$TESTBIN/exa-contents" << 'MCONT'
+#!/usr/bin/env bash
+echo '{"results":[{"url":"https://mock","text":"mock content"}]}'
+MCONT
+chmod +x "$TESTBIN/exa-contents"
+
 # Curl mock (for OR synth path only)
 MOCKCURL="$TMP/mockcurl"
 cat > "$MOCKCURL" << 'MCURL'
@@ -55,7 +75,7 @@ OUTMD="$TMP/out.md"
 run_deep() {
   local args=("$@")
   local extra_path="$TESTBIN"
-  ( cd /tmp; OPENROUTER_API_KEY="" EXA_API_KEY=dummy SERPER_API_KEY=dummy PATH="$MOCKCURL:$extra_path:$PATH" "$TESTBIN/deep-research" "${args[@]}" 2>&1 )
+  ( cd /tmp; OPENROUTER_API_KEY="" EXA_API_KEY=dummy SERPER_API_KEY=dummy EXA_BIN="$TESTBIN/exa-search" SERPER_BIN="$TESTBIN/serper-search" SOURCE_SCORE_BIN="$TESTBIN/source-score" REPORT_TEMPLATE_BIN="$TESTBIN/report-template" EXA_CONTENTS_BIN="$TESTBIN/exa-contents" PATH="$MOCKCURL:$extra_path:$PATH" "$TESTBIN/deep-research" "${args[@]}" 2>&1 )
 }
 
 # === Test 1: basic no-OR + --depth=deep + budget (fallback path) ===
@@ -91,7 +111,7 @@ fi
 echo "=== Test no-OR fallback ===" >&2
 OUT2="$TMP/out2.md"
 set +e
-run2=$( OPENROUTER_API_KEY="" EXA_API_KEY=dummy SERPER_API_KEY=dummy PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "fallback q" --depth=deep --budget=0.20 --output="$OUT2" 2>&1 ); c2=$?
+run2=$( OPENROUTER_API_KEY="" EXA_API_KEY=dummy SERPER_API_KEY=dummy EXA_BIN="$TESTBIN/exa-search" SERPER_BIN="$TESTBIN/serper-search" SOURCE_SCORE_BIN="$TESTBIN/source-score" REPORT_TEMPLATE_BIN="$TESTBIN/report-template" EXA_CONTENTS_BIN="$TESTBIN/exa-contents" PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "fallback q" --depth=deep --budget=0.20 --output="$OUT2" 2>&1 ); c2=$?
 set -e
 if [ $c2 -eq 0 ] \
    && grep -q "Partial Synthesis (no OPENROUTER_API_KEY)" "$OUT2" \
@@ -106,7 +126,7 @@ fi
 echo "=== Test budget exceed ===" >&2
 OUT3="$TMP/out3.md"
 set +e
-run3=$( MOCK_COST=0.50 EXA_API_KEY=dummy SERPER_API_KEY=dummy OPENROUTER_API_KEY="" PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "exceed q" --depth=deep --budget=0.10 --output="$OUT3" 2>&1 ); c3=$?
+run3=$( MOCK_COST=0.50 EXA_API_KEY=dummy SERPER_API_KEY=dummy OPENROUTER_API_KEY="" EXA_BIN="$TESTBIN/exa-search" SERPER_BIN="$TESTBIN/serper-search" SOURCE_SCORE_BIN="$TESTBIN/source-score" REPORT_TEMPLATE_BIN="$TESTBIN/report-template" EXA_CONTENTS_BIN="$TESTBIN/exa-contents" PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "exceed q" --depth=deep --budget=0.10 --output="$OUT3" 2>&1 ); c3=$?
 set -e
 if grep -qi "exceeded\|⚠️ Budget exceeded\|partial" "$OUT3" || echo "$run3" | grep -qi "exceeded"; then
   echo "PASS budget exceed note"
@@ -118,7 +138,7 @@ fi
 echo "=== Test with-OR synth (optional) ===" >&2
 OUT4="$TMP/out4.md"
 set +e
-run4=$( OPENROUTER_API_KEY=dummy EXA_API_KEY=dummy SERPER_API_KEY=dummy PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "or q" --depth=auto --budget=0.30 --output="$OUT4" 2>&1 ); c4=$?
+run4=$( OPENROUTER_API_KEY=dummy EXA_API_KEY=dummy SERPER_API_KEY=dummy EXA_BIN="$TESTBIN/exa-search" SERPER_BIN="$TESTBIN/serper-search" SOURCE_SCORE_BIN="$TESTBIN/source-score" REPORT_TEMPLATE_BIN="$TESTBIN/report-template" EXA_CONTENTS_BIN="$TESTBIN/exa-contents" PATH="$MOCKCURL:$TESTBIN:$PATH" "$TESTBIN/deep-research" "or q" --depth=auto --budget=0.30 --output="$OUT4" 2>&1 ); c4=$?
 set -e
 if [ $c4 -eq 0 ] && grep -q "# Deep Research Report" "$OUT4"; then
   echo "PASS OR path (or skipped gracefully)"

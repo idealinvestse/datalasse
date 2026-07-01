@@ -60,7 +60,7 @@ MDR
 chmod +x "$MOCK_DR"
 
 export MOCK_LOG="$TMP/mock.log"
-export MOCK_STATE_LIB="$ROOT_DIR/lib/research-state.sh"
+WSROOT="$(dirname "$ROOT_DIR")"; export MOCK_STATE_LIB="$WSROOT/skills/deep-research/lib/research-state.sh"
 export RESEARCH_DIR WORKSPACE_DIR DEEP_RESEARCH_BIN="$MOCK_DR"
 
 "$WATCH" --all >/dev/null
