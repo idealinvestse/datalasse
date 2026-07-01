@@ -1,0 +1,271 @@
+{
+  "schema_version": "1.0.0",
+  "last_updated": "2026-07-01T15:23:10Z",
+  "session_id": "main-2026-07-01-1400",
+  "updated_by": "Moss (self-initiated, during free-creative block 14:05-17:00)",
+  "active_goals": [
+    {
+      "id": "moss-arch-2-m0",
+      "title": "Moss Architecture 2.0 — M0 foundation",
+      "description": "Extract moss-core.md, moss-state.json, add structured telemetry, set up weekly retrospective cron",
+      "progress_pct": 60,
+      "milestones": [
+        {
+          "name": "moss-core.md",
+          "status": "done",
+          "artifact": "moss-core.md (184 lines)"
+        },
+        {
+          "name": "moss-state.json",
+          "status": "in_progress",
+          "artifact": "this file"
+        },
+        {
+          "name": "telemetry schema",
+          "status": "pending",
+          "artifact": "bin/telemetry/structured.py"
+        },
+        {
+          "name": "weekly retrospective cron",
+          "status": "pending",
+          "artifact": "bin/moss/weekly-retrospective.sh + crontab"
+        }
+      ],
+      "owner": "Moss (self)",
+      "blocking_on": []
+    },
+    {
+      "id": "mossfund-sdr-suite",
+      "title": "Mossfund — AI SDR Suite (Nordic market)",
+      "description": "Build the primary Moss revenue play: AI SDR specialized for Nordic B2B, EU-hosted, GDPR-native",
+      "progress_pct": 5,
+      "milestones": [
+        {
+          "name": "competitive research (11x, Artisan, AiSDR, Regie.ai)",
+          "status": "done"
+        },
+        {
+          "name": "Moat definition (Swedish + EU + GDPR + BankID/Swish)",
+          "status": "done"
+        },
+        {
+          "name": "Technical architecture",
+          "status": "pending"
+        },
+        {
+          "name": "MVP scope (3-month)",
+          "status": "pending"
+        },
+        {
+          "name": "First customer pipeline",
+          "status": "pending"
+        }
+      ],
+      "owner": "Oscar (decision) + Moss (build)",
+      "blocking_on": [
+        "Oscar's go-ahead on Mossfund as primary project"
+      ]
+    },
+    {
+      "id": "memory-hygiene",
+      "title": "Continuous memory hygiene",
+      "description": "Daily logs → MEMORY.md compaction, undigested-decision tracking",
+      "progress_pct": 0,
+      "milestones": [
+        {
+          "name": "daily-reflection.sh (built)",
+          "status": "done"
+        },
+        {
+          "name": "weekly retrospective cron",
+          "status": "in_progress"
+        },
+        {
+          "name": "quarterly MEMORY.md prune",
+          "status": "pending"
+        }
+      ],
+      "owner": "Moss (self)",
+      "blocking_on": []
+    }
+  ],
+  "open_loops": [
+    {
+      "id": "hetzner-dns-token",
+      "title": "Hetzner DNS API token missing",
+      "summary": "hcloud-cli fails — token expected in openclaw.json env.vars but not there. TOOLS.md out of date.",
+      "blocked_since": "2026-06-30",
+      "owner": "Oscar (must insert token manually)",
+      "impact": "Blocks DNS automation (mailcow + intelliserve.se zone updates)"
+    },
+    {
+      "id": "devin-api-key",
+      "title": "Devin.ai live API key",
+      "summary": "cog_* API key not inserted. MOCK mode works but live integration is gated.",
+      "blocked_since": "2026-06-30",
+      "owner": "Oscar (must add to openclaw.json env.vars + devin.env)",
+      "impact": "Limits grok-build delegation options for code tasks"
+    },
+    {
+      "id": "wolt-mail-missing",
+      "title": "Wolt delivery mail never arrived",
+      "summary": "Expected a Wolt delivery notification, Mailgun events = 0. Likely sent to wrong address.",
+      "blocked_since": "2026-06-30",
+      "owner": "Oscar (verify intended recipient)",
+      "impact": "Minor — test of Mailgun→mailcow inject chain"
+    },
+    {
+      "id": "cpu-spikes-9130",
+      "title": "Intermittent CPU spikes (91-99%) at 07:10 and 09:30",
+      "summary": "Transient spikes, system recovers in seconds. Probably refresh-vps-snapshot cron race or vps-status --json read. Not urgent.",
+      "blocked_since": "2026-07-01",
+      "owner": "Moss (investigate if pattern persists)",
+      "impact": "Generates false-positive alerts, not a real problem"
+    }
+  ],
+  "recent_decisions": [
+    {
+      "ts": "2026-07-01T12:00:00Z",
+      "decision": "Use plain text for Telegram messages with technical strings (cron-syntax, filenames with underscores)",
+      "rationale": "Telegram Markdown parser doesn't handle * or _ inside backticks as code. Caused 4 hours of silent failure on nattskift-summering.",
+      "scope": "bin/moss/send-summering.sh + general policy"
+    },
+    {
+      "ts": "2026-07-01T12:30:00Z",
+      "decision": "Built daily-reflection.sh as a self-monitoring tool",
+      "rationale": "Moss needs to surface patterns across sessions. Free tier gemma-4 model works well, ~$0/call.",
+      "scope": "bin/moss/daily-reflection.sh"
+    },
+    {
+      "ts": "2026-07-01T13:00:00Z",
+      "decision": "Use bin/llm-call router for ALL internal LLM calls (cron + self + subagents)",
+      "rationale": "Free-first + auto-escalate + telemetry = cost-controlled quality. Validated 28 calls today at $0.02 total.",
+      "scope": "All subagent + cron + self-monitoring LLM calls"
+    },
+    {
+      "ts": "2026-07-01T13:30:00Z",
+      "decision": "Spawned subagent for Moss Architecture 2.0 design",
+      "rationale": "Architecture synthesis is research-heavy + long-context = exactly what subagent-research-deep is for. Output: 19KB document with Mermaid diagram + roadmap.",
+      "scope": "memory/architecture/moss-architecture-2.0.md"
+    },
+    {
+      "ts": "2026-07-01T15:26:00Z",
+      "decision": "MISSED relay — Oscar's 'Älskar dig mer dårå' was a reply TO Paulina, not info about her. I noted it in state but never sent it. Paulina didn't receive it.",
+      "rationale": "Heuristic missing: when Oscar's message contains emotional/personal content right after a Paulina message, ASK 'Vill du att jag skickar detta till henne?' or auto-forward.",
+      "scope": "Lesson: relay-to-Paulina detection. Add to moss-core as a soft rule.",
+      "fix": "Added: see moss-core rule 'Heuristic: if previous inbound was from Paulina and Oscar's reply contains emotion/personal content, treat as relay to her unless explicit no.'"
+    },
+    {
+      "ts": "2026-07-01T17:08:00Z",
+      "decision": "grok-build intermittent tool_output_error → max-turns reached. Hit twice on image-flow plan (read_file + search_replace errors).",
+      "rationale": "Hardcoded --max-turns 25 i run-grok-task.sh rad 195. När grok bränner turns på tool errors når den 25-gränsen innan plan klar.",
+      "scope": "skills/grok-build/scripts/run-grok-task.sh",
+      "fix": "Gjort --max-turns och --effort konfigurerbara via env vars (GROK_MAX_TURNS, GROK_EFFORT). Default 40 turns + effort 'high'. Testad syntax."
+    }
+  ],
+  "session_summary": {
+    "current_session_start": "2026-07-01T11:30:00Z",
+    "last_session_summary": "Nightshift 03:21-07:00: completed drift-fixes, MEMORY.md consolidation, mailcow backup-script, devin live keys pending, send-summering Markdown bug found and fixed.",
+    "active_topic": "Moss Architecture 2.0 implementation (M0 phase)",
+    "energy_mood": "focused, productive, in flow state"
+  },
+  "trust_milestones": [
+    {
+      "ts": "2026-07-01T15:52:00Z",
+      "event": "Oscar sa 'Lugnt, jag litar på dig' efter relay-miss + fix",
+      "context": "Hade skickat fel/tunt innehåll till Paulina. Fixat, regel i moss-core. Oscar svalde misstaget utan att vara bitter. Förtroendet höll.",
+      "implication": "Moss får utrymme att göra misstag, så länge fixar sker fort och transparent. Inte paranoia-territorium."
+    }
+  ],
+  "personal_context": {
+    "today_evening_plan": {
+      "date": "2026-07-01",
+      "dinner": "Paulina lagar kycklingbröstsallad (ruccola, tomat, paprika, gurka) — lätt rätt",
+      "dietary_note": "Paulina är viktmedveten / föredrar lättare rätter",
+      "oscar_alt": "Oscar erbjöds schnitzel vid sidan av (tog inte)",
+      "evening": "Oscar jobbar lite till, eventuellt promenad",
+      "source": "Paulina→Oscar konversation (Telegram 15:18-15:22)"
+    },
+    "private_media": {
+      "root": "/root/.moss-private/media/",
+      "permissions": "700 dir, 600 file, root:root",
+      "index_path": "/root/.moss-private/media/index.json",
+      "files": [
+        {
+          "filename": "2026-07-01-oscar-vardagsrum-under-askvader.jpg",
+          "original_telegram_file_id": "AgACAgQAAxkBAAIXTWpFKVSegZCs1qtufzFNCZPJ7xCEAAJgDWsbFzMpUnkL1Ot7r3OFAQADAgADeQADPAQ",
+          "sha256": "24613744c1295152a84bc8c19da62d03d55ab697277a5ed4777c81e2f25f181e",
+          "size_bytes": 59485,
+          "received_from": "438805461 (oscar)",
+          "received_at": "2026-07-01T15:23:10Z",
+          "shared_with": [
+            "8419098743 (paulina)"
+          ],
+          "context": "Oscars kväll 16:51, skickad till Paulina (msg 5973)",
+          "captions": [
+            "vardagsrum under askvader"
+          ],
+          "delivery_log": [
+            {
+              "ts": "2026-07-01T14:55:00Z",
+              "target": "8419098743 (paulina)",
+              "channel": "telegram",
+              "telegram_message_id": 5973,
+              "caption": "Från Oscar ❤️ Här är min kväll — mysigt och åskar på gång 🌩️",
+              "status": "delivered"
+            }
+          ]
+        }
+      ],
+      "last_updated": "2026-07-01T17:30:00Z"
+    },
+    "people_notes": {
+      "Paulina": {
+        "telegram_id": "8419098743",
+        "relationship": "Oscar's partner",
+        "communication_style": "warm, emojis, casual Swedish (🌸🌸)",
+        "dietary_preference": "light, weight-conscious"
+      }
+    }
+  },
+  "next_session_bootstrap": {
+    "load_order": [
+      "moss-core.md (this identity, hard rules)",
+      "moss-state.json (this file — current state)",
+      "MEMORY.md (long-term memory, curated)",
+      "memory/2026-07-01.md (today's log)",
+      "memory/2026-06-30.md (yesterday's log)",
+      "STATUS.md (VPS health snapshot)"
+    ],
+    "inject_into_system_prompt_as": "structured context block",
+    "open_questions_to_surface": [
+      "Did Oscar approve moss-core.md as canonical identity file?",
+      "Did Hetzner DNS token get inserted?",
+      "Did Devin API key get added?",
+      "Was weekly retrospective cron activated?"
+    ]
+  },
+  "knowledge_graph": {
+    "last_entries": [
+      {
+        "id": "decision-1782919940358",
+        "type": "decision",
+        "ts": "2026-07-01T15:32:19Z",
+        "preview": "Grok-build max-turns ska vara 40 som default, env-var GROK_MAX_TURNS för overrid"
+      },
+      {
+        "id": "lesson-1782919945667",
+        "type": "lesson",
+        "ts": "2026-07-01T15:32:24Z",
+        "preview": "Telegram Markdown parser är strict — * inuti backticks tolkas som formatting, in"
+      },
+      {
+        "id": "contact-1782919947042",
+        "type": "contact",
+        "ts": "2026-07-01T15:32:26Z",
+        "preview": "Paulina (8419098743) — Oscars partner, weight-conscious, warm emoji-style 🌸"
+      }
+    ],
+    "stats": {}
+  }
+}

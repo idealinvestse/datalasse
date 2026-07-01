@@ -187,12 +187,18 @@ run_plan_phase() {
   echo "workdir: $workdir"
   echo "taskId: $task_id"
 
+  # Tunable knobs (override via env var: GROK_MAX_TURNS, GROK_EFFORT)
+  GROK_MAX_TURNS="${GROK_MAX_TURNS:-40}"
+  GROK_EFFORT="${GROK_EFFORT:-high}"
+  echo "max-turns: $GROK_MAX_TURNS  effort: $GROK_EFFORT"
+
   cd "$workdir"
   "$GROK" -p "$(cat "$prompt_file")" \
     --cwd "$workdir" \
     --model "$MODEL" \
     --output-format plain \
-    --max-turns 25
+    --effort "$GROK_EFFORT" \
+    --max-turns "$GROK_MAX_TURNS"
 
   local plan_path session_id
   plan_path="$(find_latest_plan "$workdir" || true)"
