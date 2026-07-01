@@ -1,0 +1,46 @@
+{
+  "episode_number": "TEST",
+  "total_duration_seconds": 60.0,
+  "segments": [
+    {
+      "start": 0,
+      "end": 5,
+      "text": "Hey, this is Red Band and you are listening to Kill Tony"
+    },
+    {
+      "start": 5,
+      "end": 10,
+      "text": "Lets get into the bucket, the first name tonight"
+    },
+    {
+      "start": 10,
+      "end": 20,
+      "text": "Mason Bird please come to the stage"
+    },
+    {
+      "start": 20,
+      "end": 30,
+      "text": "one minute starts now"
+    },
+    {
+      "start": 30,
+      "end": 35,
+      "text": "that was wild, thank you"
+    },
+    {
+      "start": 35,
+      "end": 45,
+      "text": "next name out of the bucket, lets go"
+    },
+    {
+      "start": 45,
+      "end": 50,
+      "text": "goodnight everybody"
+    },
+    {
+      "start": 50,
+      "end": 60,
+      "text": "check out deathtv.com"
+    }
+  ]
+}

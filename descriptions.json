@@ -1,0 +1,29 @@
+{
+  "frames_dir": "data/test-vision/frames",
+  "model": "llama-4-scout-groq",
+  "count": 3,
+  "estimated_cost_usd": 0.0004,
+  "descriptions": [
+    {
+      "frame_path": "data/test-vision/frames/frame-0001-t0.0s.jpg",
+      "timestamp": 0,
+      "description": "Bilden visar en solid blå bakgrund med texten \"0s\" i det övre vänstra hörnet. Stämningen är minimalistisk och tom, med en känsla av lugn och stillhet.",
+      "model": "llama-4-scout-groq",
+      "cost_usd": 0.00021020000000000001
+    },
+    {
+      "frame_path": "data/test-vision/frames/frame-0002-t5.0s.jpg",
+      "timestamp": 5.0,
+      "description": "Bilden visar en solid blå skärm med texten \"5s\" i det övre vänstra hörnet. Det finns ingen scen eller känsla att beskriva utöver den blå färgen och den korta texten.",
+      "model": "llama-4-scout-groq",
+      "cost_usd": 0.0002111
+    },
+    {
+      "frame_path": "data/test-vision/frames/frame-0003-t10.0s.jpg",
+      "timestamp": 10,
+      "description": "Bilden visar en solid blå skärm med texten \"10s\" i det övre vänstra hörnet. Stämningen är lugn och minimalistisk.",
+      "model": "llama-4-scout-groq",
+      "cost_usd": 0.00020690000000000001
+    }
+  ]
+}

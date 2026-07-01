@@ -1,0 +1,33 @@
+{
+  "highlights": [
+    {
+      "approx_timestamp": "0:10",
+      "category": "moment",
+      "description": "First bucket pull"
+    },
+    {
+      "approx_timestamp": "0:30",
+      "category": "joke",
+      "description": "Mason Bird joke"
+    },
+    {
+      "approx_timestamp": "0:45",
+      "category": "bucket_pull",
+      "description": "Second pull"
+    }
+  ],
+  "main_guests": [
+    "TEST GUEST"
+  ],
+  "bucket_pullers": [
+    "Mason Bird",
+    "TEST PULLER"
+  ],
+  "co_hosts": [
+    "Tony Hinchcliffe",
+    "Brian Redban"
+  ],
+  "summary": "Test episode",
+  "tone": "mixed",
+  "best_moment": "Mason Bird joke"
+}
