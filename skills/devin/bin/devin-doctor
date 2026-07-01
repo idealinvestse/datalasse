@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""devin-doctor — Verify Devin API credentials + basic health.
+
+Auto-creates ~/.config/devin/devin.env (600) from template if missing.
+Exits 0 only on success (with MOCK or real 200).
+"""
+
+import os
+import sys
+from pathlib import Path
+
+# make lib importable when invoked as skills/devin/bin/devin-doctor
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from lib.devin_client import DevinClient
+from lib.log import log
+
+
+def _mask(s: str | None) -> str:
+    if not s:
+        return "(unset)"
+    if len(s) <= 8:
+        return s[:2] + "****"
+    return s[:4] + "****" + s[-4:]
+
+
+def ensure_config() -> Path:
+    cfg_dir = Path.home() / ".config" / "devin"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(cfg_dir, 0o700)
+    except Exception:
+        pass
+
+    env_file = cfg_dir / "devin.env"
+    template = ROOT / "templates" / ".env.example"
+
+    if not env_file.exists():
+        if template.exists():
+            content = template.read_text()
+            env_file.write_text(content)
+            log(f"Created {env_file} from template", "INFO")
+        else:
+            # fallback minimal
+            env_file.write_text(
+                "DEVIN_API_KEY=cog_placeholder\n"
+                "DEVIN_ORG_ID=org_placeholder\n"
+                "DEVIN_BASE_URL=https://api.devin.ai/v3\n"
+                "DEVIN_DEFAULT_MAX_ACU=10\n"
+            )
+            log("Created minimal devin.env (edit it)", "WARN")
+        try:
+            os.chmod(env_file, 0o600)
+        except Exception:
+            pass
+    else:
+        try:
+            os.chmod(env_file, 0o600)
+        except Exception:
+            pass
+
+    return env_file
+
+
+def main() -> int:
+    print("devin-doctor: checking Devin API credentials and health")
+    ensure_config()
+
+    mock = bool(os.getenv("MOCK"))
+    client = DevinClient(dry_run=mock)
+
+    key = client.api_key or os.getenv("DEVIN_API_KEY")
+    org = client.org_id or os.getenv("DEVIN_ORG_ID")
+
+    print(f"  API key: {_mask(key)}")
+    print(f"  Org ID : {_mask(org) if org else '(unset)'}")
+    print(f"  Base   : {client.base_url}")
+    print(f"  Mode   : {'MOCK/dry-run' if client.dry_run else 'LIVE'}")
+
+    if not key or not org:
+        print("FAIL: DEVIN_API_KEY and DEVIN_ORG_ID are required (set in env or ~/.config/devin/devin.env)")
+        return 1
+
+    ok = client.health_check()
+    if ok:
+        print("OK: credentials present and API reachable (or MOCK)")
+        log("doctor OK", "INFO")
+        return 0
+    else:
+        print("FAIL: could not reach API (check key/org/network). See stderr log.")
+        log("doctor health check failed", "WARN")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

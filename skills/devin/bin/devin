@@ -1,0 +1,308 @@
+#!/usr/bin/env python3
+"""devin — CLI for Devin.ai sessions (v3).
+
+Usage examples:
+  MOCK=1 devin doctor
+  MOCK=1 devin create "fix the bug"
+  MOCK=1 devin create --max-acu 100 --yes "..."
+  devin watch <sid> --max 10m
+  devin list
+
+Outputs session_id alone on create success for piping.
+Respects NO_COLOR, MOCK, --dry-run.
+"""
+
+import argparse
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from lib.devin_client import DevinClient
+from lib.log import log
+
+# Colors (respect NO_COLOR + TTY)
+NO_COLOR = bool(os.getenv("NO_COLOR"))
+USE_COLOR = sys.stdout.isatty() and not NO_COLOR
+
+C = {
+    "green": "\033[0;32m",
+    "red": "\033[0;31m",
+    "yellow": "\033[0;33m",
+    "cyan": "\033[0;36m",
+    "reset": "\033[0m",
+} if USE_COLOR else {k: "" for k in ["green", "red", "yellow", "cyan", "reset"]}
+
+
+def c(text: str, color: str) -> str:
+    return f"{C.get(color, '')}{text}{C['reset']}"
+
+
+def mask_key(k: str | None) -> str:
+    if not k:
+        return "(unset)"
+    return k[:4] + "****" + k[-4:] if len(k) > 8 else k[:2] + "****"
+
+
+def print_table(rows: list[dict[str, Any]], headers: list[str]) -> None:
+    if not rows:
+        print("(no results)")
+        return
+    # simple column widths
+    cols = {h: max(len(h), max((len(str(r.get(h, ""))) for r in rows), default=0)) for h in headers}
+    line = "  ".join(h.ljust(cols[h]) for h in headers)
+    print(line)
+    print("-" * len(line))
+    for r in rows:
+        print("  ".join(str(r.get(h, "")).ljust(cols[h]) for h in headers))
+
+
+def load_client(dry_run: bool = False) -> DevinClient:
+    return DevinClient(dry_run=dry_run or bool(os.getenv("MOCK")))
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    # Delegate to the dedicated doctor script (ensures auto-create + 600 logic)
+    import subprocess
+    from pathlib import Path
+    doc = Path(__file__).parent / "devin-doctor"
+    rc = subprocess.call([str(doc)] + (["--dry-run"] if args.dry_run else []))
+    return rc
+
+
+def cmd_create(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    try:
+        data = client.create_session(
+            prompt=args.prompt,
+            max_acu_limit=args.max_acu,
+            tags=args.tags,
+            repos=args.repo,
+            devin_mode=args.mode,
+            structured_output_schema=None,
+            yes=args.yes,
+        )
+    except ValueError as e:
+        print(c(str(e), "yellow"), file=sys.stderr)
+        return 2
+    sid = data.get("session_id", "")
+    # UX rule: print ONLY the id on success (pipeable)
+    print(sid)
+    log(f"create success sid={sid}", "INFO", session_id=sid)
+    return 0
+
+
+def cmd_list(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    sessions = client.list_sessions(limit=args.limit)
+    rows = []
+    for s in sessions:
+        rows.append({
+            "id": s.get("session_id", "")[:20],
+            "status": s.get("status", ""),
+            "acu": s.get("acus_consumed", ""),
+            "created": str(s.get("created_at", ""))[:19],
+        })
+    print_table(rows, ["id", "status", "acu", "created"])
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    s = client.get_session(args.session_id)
+    if args.json:
+        import json
+        print(json.dumps(s, indent=2, default=str))
+    else:
+        print(f"session_id: {s.get('session_id')}")
+        print(f"status    : {c(s.get('status',''), 'cyan')}")
+        print(f"ACUs      : {s.get('acus_consumed')}")
+        print(f"url       : {s.get('url') or s.get('urls', {}).get('web', '')}")
+    return 0
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    max_wait = args.max
+    # parse simple 10m / 60s / seconds
+    if isinstance(max_wait, str):
+        mw = max_wait.lower().rstrip("s")
+        if mw.endswith("m"):
+            max_wait = int(mw[:-1]) * 60
+        else:
+            max_wait = int(mw)
+
+    def on_status(st: str, sess: dict) -> None:
+        acu = sess.get("acus_consumed", "?")
+        print(f"[{time.strftime('%H:%M:%S')}] status={c(st, 'cyan')} acu={acu}")
+
+    try:
+        final = client.wait_for_completion(args.session_id, poll_interval=5, max_wait=max_wait, on_status=on_status)
+        print(c(f"Done: {final.get('status')} (ACU {final.get('acus_consumed')})", "green"))
+        return 0
+    except TimeoutError as e:
+        print(c(str(e), "yellow"))
+        return 1
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    client.send_message(args.session_id, args.message)
+    print(c("message sent", "green"))
+    return 0
+
+
+def cmd_kill(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    ok = client.kill_session(args.session_id)
+    print(c("killed", "green") if ok else c("kill attempted", "yellow"))
+    return 0 if ok else 1
+
+
+def cmd_attach(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    res = client.upload_attachment(args.session_id, args.file)
+    print(c(f"attached: {res}", "green"))
+    return 0
+
+
+def cmd_result(args: argparse.Namespace) -> int:
+    client = load_client(args.dry_run)
+    s = client.get_session(args.session_id)
+    out = s.get("structured_output")
+    if out is not None:
+        import json
+        print(json.dumps(out, indent=2, default=str))
+    else:
+        print(s.get("result") or "(no structured_output)")
+    return 0
+
+
+def cmd_logs(args: argparse.Namespace) -> int:
+    log_path = Path.home() / ".openclaw" / "workspace" / "memory" / "devin" / "devin.log"
+    if not log_path.exists():
+        print("no log yet")
+        return 0
+    if args.follow:
+        # simple tail -f
+        with log_path.open() as f:
+            f.seek(0, 2)
+            while True:
+                line = f.readline()
+                if line:
+                    print(line.rstrip())
+                else:
+                    time.sleep(0.5)
+    else:
+        # last N
+        lines = log_path.read_text().splitlines()[-args.tail:]
+        for l in lines:
+            print(l)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="devin", description="Devin.ai session manager")
+    p.add_argument("--dry-run", action="store_true", help="Alias for MOCK (no network)")
+    p.add_argument("--json", action="store_true", help="JSON output where applicable")
+
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # doctor
+    sd = sub.add_parser("doctor", help="Check API key + health")
+    sd.add_argument("--dry-run", action="store_true")
+    sd.set_defaults(func=cmd_doctor)
+
+    # create
+    sc = sub.add_parser("create", help="Create new session")
+    sc.add_argument("prompt", help="Task prompt")
+    sc.add_argument("--max-acu", type=int, default=10, dest="max_acu")
+    sc.add_argument("--repo", action="append", default=None, help="repo to clone (repeatable)")
+    sc.add_argument("--tag", action="append", dest="tags", default=None)
+    sc.add_argument("--mode", default="normal", choices=["normal", "fast", "lite", "ultra"])
+    sc.add_argument("--yes", action="store_true", help="Confirm high ACU spend (>50)")
+    sc.add_argument("--dry-run", action="store_true")
+    sc.set_defaults(func=cmd_create)
+
+    # list
+    sl = sub.add_parser("list", help="List recent sessions")
+    sl.add_argument("--limit", type=int, default=20)
+    sl.add_argument("--dry-run", action="store_true")
+    sl.set_defaults(func=cmd_list)
+
+    # status
+    ss = sub.add_parser("status", help="Show session status")
+    ss.add_argument("session_id")
+    ss.add_argument("--dry-run", action="store_true")
+    ss.set_defaults(func=cmd_status)
+
+    # watch
+    sw = sub.add_parser("watch", help="Poll until terminal status")
+    sw.add_argument("session_id")
+    sw.add_argument("--max", default="3600", help="max wait (seconds or 10m)")
+    sw.add_argument("--dry-run", action="store_true")
+    sw.set_defaults(func=cmd_watch)
+
+    # send
+    sm = sub.add_parser("send", help="Send message to session")
+    sm.add_argument("session_id")
+    sm.add_argument("message")
+    sm.add_argument("--dry-run", action="store_true")
+    sm.set_defaults(func=cmd_send)
+
+    # kill
+    sk = sub.add_parser("kill", help="Cancel session")
+    sk.add_argument("session_id")
+    sk.add_argument("--dry-run", action="store_true")
+    sk.set_defaults(func=cmd_kill)
+
+    # attach
+    sa = sub.add_parser("attach", help="Upload attachment")
+    sa.add_argument("session_id")
+    sa.add_argument("file")
+    sa.add_argument("--dry-run", action="store_true")
+    sa.set_defaults(func=cmd_attach)
+
+    # result
+    sr = sub.add_parser("result", help="Print structured_output / final result")
+    sr.add_argument("session_id")
+    sr.add_argument("--dry-run", action="store_true")
+    sr.set_defaults(func=cmd_result)
+
+    # logs
+    slg = sub.add_parser("logs", help="Tail integration logs")
+    slg.add_argument("session_id", nargs="?")
+    slg.add_argument("-f", "--follow", action="store_true")
+    slg.add_argument("--tail", type=int, default=50)
+    slg.set_defaults(func=cmd_logs)
+
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv or sys.argv[1:]
+    # support MOCK=1 as global
+    if os.getenv("MOCK"):
+        if "--dry-run" not in argv:
+            argv = ["--dry-run"] + argv
+
+    p = build_parser()
+    args = p.parse_args(argv)
+
+    # high cost guard at top level for create already in handler
+    try:
+        return args.func(args)  # type: ignore
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        print(c(f"ERROR: {e}", "red"), file=sys.stderr)
+        log(f"cli error: {e}", "ERROR")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
