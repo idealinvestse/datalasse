@@ -1,3 +1,0 @@
-#!/usr/bin/env bash
-# Shim for research ecosystem -- forwards to skills/deep-research/bin/
-exec "$(dirname "$0")/../skills/deep-research/bin/$(basename "$0")" "$@"
