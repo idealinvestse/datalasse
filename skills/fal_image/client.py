@@ -16,6 +16,8 @@ from .registry import (
     choose_model,
 )
 from .safety import with_safety_off
+from .router import route_use_case, detect_use_case, get_use_case_chain
+from .utils import upload_image
 
 
 def generate(
@@ -142,4 +144,73 @@ def choose_and_generate(
     return generate(prompt, model=model_id, **kwargs)
 
 
-__all__ = ["generate", "edit", "variations", "choose_and_generate"]
+# ------------------------------------------------------------------
+# NEW high-level functions (R4) — all respect with_safety_off
+# ------------------------------------------------------------------
+
+def generate_for_use_case(use_case: str | None, prompt: str, **kwargs: Any) -> dict:
+    """Auto-route by use_case (or auto-detect from prompt) then generate."""
+    uc = use_case or detect_use_case(prompt)
+    model = route_use_case(uc, **kwargs)
+    return generate(prompt, model=model, **kwargs)
+
+
+def edit_with_model(image_url: str, prompt: str, model_id: str, **kwargs: Any) -> dict:
+    """Explicit model edit (image-to-image)."""
+    return edit(image_url, prompt, model=model_id, **kwargs)
+
+
+def upscale(image_url: str, scale: int = 2, model: str | None = None, **kwargs: Any) -> dict:
+    """Wrapper for clarity-upscaler (or esrgan)."""
+    model_id = model or "fal-ai/clarity-upscaler"
+    if not image_url.startswith(("http://", "https://", "fal://")):
+        image_url = upload_image(image_url)
+    args: dict[str, Any] = {"image_url": image_url, "scale": scale}
+    args.update(kwargs)
+    safe_args = with_safety_off(model_id, args)
+    return fal_client.subscribe(model_id, arguments=safe_args, with_logs=True)
+
+
+def remove_background(image_url: str, model: str | None = None, **kwargs: Any) -> dict:
+    """Wrapper for bria/imageutils background removal."""
+    model_id = model or "fal-ai/bria/background/remove"
+    if not image_url.startswith(("http://", "https://", "fal://")):
+        image_url = upload_image(image_url)
+    args: dict[str, Any] = {"image_url": image_url}
+    args.update(kwargs)
+    safe_args = with_safety_off(model_id, args)
+    return fal_client.subscribe(model_id, arguments=safe_args, with_logs=True)
+
+
+def make_vector(prompt: str, model: str | None = None, **kwargs: Any) -> dict:
+    """Recraft vector/SVG specialist."""
+    model_id = model or "fal-ai/recraft/v4/text-to-vector"
+    return generate(prompt, model=model_id, **kwargs)
+
+
+def make_transparent(image_url_or_prompt: str, **kwargs: Any) -> dict:
+    """Ideogram V4 for native alpha (prompt) or pass-through for URL."""
+    if image_url_or_prompt.startswith(("http://", "https://", "fal://")):
+        # For URL, use ideogram edit or just return (user can chain with bg remove)
+        return generate("transparent version", model="ideogram/v4", image_url=image_url_or_prompt, **kwargs)
+    return generate(image_url_or_prompt, model="ideogram/v4", **kwargs)
+
+
+def make_variations(image_url: str, n: int = 4, model: str | None = None, **kwargs: Any) -> list[dict]:
+    """Variations (enhanced pass-through to existing)."""
+    return variations(image_url, n=n, model=model, **kwargs)
+
+
+def batch_generate(prompts: list[str], model: str | None = None, **kwargs: Any) -> list[dict]:
+    """Simple batch (sequential for safety; can upgrade to submit later)."""
+    results = []
+    for p in prompts:
+        results.append(generate(p, model=model, **kwargs))
+    return results
+
+
+__all__ = [
+    "generate", "edit", "variations", "choose_and_generate",
+    "generate_for_use_case", "edit_with_model", "upscale", "remove_background",
+    "make_vector", "make_transparent", "make_variations", "batch_generate",
+]

@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 # Import the canonical implementation from fal-ai skill
+# New Q3 models (flux-2-pro/edit etc) are covered via fal-ai/safety_off.py updates.
 _fal_ai_safety = Path(__file__).parent.parent / "fal-ai" / "safety_off.py"
 
 if _fal_ai_safety.exists():

@@ -43,8 +43,11 @@ SAFETY_OFF_DEFAULTS: dict[str, dict] = {
     "fal-ai/flux/schnell":                {"enable_safety_checker": False},
     "fal-ai/flux/dev":                    {"enable_safety_checker": False},
     "fal-ai/flux-2-pro":                  {"enable_safety_checker": False, "safety_tolerance": "6"},
+    "fal-ai/flux-2-pro/edit":             {"enable_safety_checker": False, "safety_tolerance": "6"},
     "fal-ai/flux-kontext-lora":           {"enable_safety_checker": False},
     "ideogram/v4":                        {"enable_safety_checker": False},
+    "fal-ai/flux-pro/kontext/max":        {"safety_tolerance": "6"},
+    "fal-ai/nano-banana-pro":             {"safety_tolerance": "6"},
     "alibaba/happy-horse/text-to-video":  {"enable_safety_checker": False},
     # --- safety_tolerance ---
     "fal-ai/flux-pro/v1.1-ultra":         {"safety_tolerance": "6"},

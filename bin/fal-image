@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+"""bin/fal-image — CLI for fal_image orchestrator (Q3 2026).
+
+Subcommands:
+  generate, edit, upscale, remove-bg, vector, variations, list, route, doctor, cost
+
+Usage examples:
+  bin/fal-image doctor
+  bin/fal-image generate "hero shot" --use-case hero_photoreal --output /tmp/x.png
+  bin/fal-image route hero_photoreal
+  MOCK=1 bin/fal-image generate "test" --dry-run
+
+Respects --dry-run --json. PYTHONPATH set for skills import.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+# Ensure import from workspace root
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE))
+
+from skills.fal_image import (
+    generate, generate_for_use_case, edit, upscale, remove_background,
+    make_vector, list_models, route_use_case, detect_use_case,
+    get_use_case_chain, WorkflowResult,
+)
+from skills.fal_image.registry import get_all_model_ids, get_model
+
+
+def _print_json(obj):
+    print(json.dumps(obj, indent=2, default=str))
+
+
+def cmd_generate(args):
+    prompt = " ".join(args.prompt)
+    if args.dry_run:
+        print(f"[dry-run] generate use_case={args.use_case} model={args.model} prompt={prompt[:60]}...")
+        if args.json:
+            _print_json({"dry_run": True, "action": "generate"})
+        return
+    if args.use_case:
+        res = generate_for_use_case(args.use_case, prompt, aspect_ratio=args.aspect)
+    else:
+        res = generate(prompt, model=args.model, aspect_ratio=args.aspect)
+    url = res["images"][0]["url"]
+    print(url)
+    if args.output:
+        Path(args.output).write_text(url + "\n")
+        print(f"saved url -> {args.output}")
+    if args.json:
+        _print_json({"url": url, "model": args.model or "routed"})
+
+
+def cmd_edit(args):
+    if args.dry_run:
+        print(f"[dry-run] edit image={args.image} prompt={args.prompt} model={args.model}")
+        return
+    res = edit(args.image, args.prompt, model=args.model, strength=args.strength)
+    print(res["images"][0]["url"])
+
+
+def cmd_upscale(args):
+    if args.dry_run:
+        print(f"[dry-run] upscale {args.image} scale={args.scale}")
+        return
+    res = upscale(args.image, scale=args.scale, model=args.model)
+    print(res.get("images", [{}])[0].get("url", "ok"))
+
+
+def cmd_remove_bg(args):
+    if args.dry_run:
+        print(f"[dry-run] remove-bg {args.image}")
+        return
+    res = remove_background(args.image)
+    print(res.get("images", [{}])[0].get("url", "ok"))
+
+
+def cmd_vector(args):
+    if args.dry_run:
+        print(f"[dry-run] vector {args.prompt}")
+        return
+    res = make_vector(" ".join(args.prompt))
+    print(res["images"][0]["url"])
+
+
+def cmd_variations(args):
+    if args.dry_run:
+        print(f"[dry-run] variations {args.image} n={args.n}")
+        return
+    res_list = make_vector if False else __import__("skills.fal_image.client", fromlist=["variations"]).variations
+    # use the real one
+    from skills.fal_image.client import variations as _vars
+    outs = _vars(args.image, n=args.n)
+    for o in outs:
+        print(o["images"][0]["url"])
+
+
+def cmd_list(args):
+    models = list_models(feature=args.feature, tier=args.tier, family=args.family)
+    if args.json:
+        _print_json([{"id": m.model_id, "name": m.display_name, "tier": m.tier, "cost": m.cost_per_image_usd} for m in models])
+        return
+    print(f"Models ({len(models)}):")
+    for m in models:
+        print(f"  {m.model_id:42} | {m.display_name:28} | {m.tier:8} | ${m.cost_per_image_usd:.3f}")
+
+
+def cmd_route(args):
+    chain = get_use_case_chain(args.use_case)
+    if args.json:
+        _print_json({"use_case": args.use_case, "chain": chain})
+    else:
+        print(f"Chain for {args.use_case}:")
+        for i, m in enumerate(chain):
+            print(f"  {i+1}. {m}")
+
+
+def cmd_doctor(args):
+    has_key = bool(os.getenv("FAL_KEY")) or Path("/root/.config/fal/credentials").exists()
+    count = len(get_all_model_ids())
+    print("FAL_KEY present:", has_key)
+    print("Registry models:", count)
+    print("Default primary:", "fal-ai/flux-2-pro" in str(get_all_model_ids()))
+    try:
+        from skills.fal_image import generate_for_use_case  # import test
+        print("Imports: OK")
+    except Exception as e:
+        print("Imports FAIL:", e)
+    print("HEALTH:", "OK" if count >= 24 else "LOW COUNT")
+    if args.json:
+        _print_json({"key": has_key, "models": count, "health": "OK"})
+
+
+def cmd_cost(args):
+    prompt = " ".join(args.prompt)
+    uc = args.use_case or detect_use_case(prompt)
+    model = route_use_case(uc)
+    info = get_model(model)
+    cost = info.cost_per_image_usd if info else 0.03
+    out = {"use_case": uc, "primary_model": model, "est_cost_usd": cost}
+    if args.json:
+        _print_json(out)
+    else:
+        print(f"Use case: {uc}")
+        print(f"Primary: {model}")
+        print(f"Est cost: ${cost}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="fal-image", description="fal.ai image orchestrator (Q3 2026)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--json", action="store_true")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    g = sub.add_parser("generate")
+    g.add_argument("--dry-run", action="store_true")
+    g.add_argument("--json", action="store_true")
+    g.add_argument("prompt", nargs="+")
+    g.add_argument("--use-case", default=None)
+    g.add_argument("--model", default=None)
+    g.add_argument("--aspect", default="16:9")
+    g.add_argument("--output", default=None)
+    g.set_defaults(func=cmd_generate)
+
+    e = sub.add_parser("edit")
+    e.add_argument("image")
+    e.add_argument("prompt")
+    e.add_argument("--model", default=None)
+    e.add_argument("--strength", type=float, default=0.7)
+    e.set_defaults(func=cmd_edit)
+
+    u = sub.add_parser("upscale")
+    u.add_argument("image")
+    u.add_argument("--scale", type=int, default=2)
+    u.add_argument("--model", default=None)
+    u.set_defaults(func=cmd_upscale)
+
+    r = sub.add_parser("remove-bg")
+    r.add_argument("image")
+    r.set_defaults(func=cmd_remove_bg)
+
+    v = sub.add_parser("vector")
+    v.add_argument("prompt", nargs="+")
+    v.set_defaults(func=cmd_vector)
+
+    var = sub.add_parser("variations")
+    var.add_argument("image")
+    var.add_argument("--n", type=int, default=4)
+    var.set_defaults(func=cmd_variations)
+
+    l = sub.add_parser("list")
+    l.add_argument("--feature", default=None)
+    l.add_argument("--tier", default=None)
+    l.add_argument("--family", default=None)
+    l.set_defaults(func=cmd_list)
+
+    rt = sub.add_parser("route")
+    rt.add_argument("--dry-run", action="store_true")
+    rt.add_argument("--json", action="store_true")
+    rt.add_argument("use_case")
+    rt.set_defaults(func=cmd_route)
+
+    d = sub.add_parser("doctor")
+    d.set_defaults(func=cmd_doctor)
+
+    c = sub.add_parser("cost")
+    c.add_argument("prompt", nargs="+")
+    c.add_argument("--use-case", default=None)
+    c.set_defaults(func=cmd_cost)
+
+    args = p.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()

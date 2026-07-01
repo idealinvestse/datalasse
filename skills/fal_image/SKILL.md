@@ -1,117 +1,238 @@
-# fal-image (updated 2026-06-22)
+# fal-image (Q3 2026 — Production Optimized)
 
-**Status:** MVP complete — ready for production use.
+**Status:** Complete registry (24+ models), use-case routing (11 chains), workflows, CLI, tests. Ready for production.
 
-Orchestrates all fal.ai image generation with a central model registry, mandatory safety-off enforcement, smart defaults, editing workflows, and high-level helpers.
+Orchestrates **all** fal.ai image generation intelligently using the Q3 2026 landscape. Primary recommendation: `fal-ai/flux-2-pro` as new default all-rounder.
 
-This skill owns **everything image-related** via fal.ai. The broader `fal-ai` skill handles video, audio, workflows, 3D, and LLM-proxy usage.
-
-**Note:** A duplicate "create" skill_workshop proposal was incorrectly filed on 2026-06-22 (the directory and implementation already existed). The skill is fully operational.
+The broader `fal-ai` skill handles video, audio, 3D, LLM-proxy, advanced workflows.
 
 ## When to use this skill
 
-- You want to generate or edit images using any fal.ai image model.
-- You want automatic enforcement of the workspace safety-off policy (`enable_safety_checker=false` + `safety_tolerance=6`).
-- You want a capability-aware model registry instead of hardcoding model IDs everywhere.
-- You need edit workflows, multi-reference support, batch/variations, or intelligent model routing.
+- Generate/edit images with intelligent per-use-case model selection.
+- Need automatic workspace safety-off (`enable_safety_checker=false` + `safety_tolerance=6`).
+- Want capability-aware registry, use-case routing, multi-step workflows, or vector/transparent/upscale.
+- CLI or Python API for batch, variations, cost estimation.
 
 ## When NOT to use this skill
 
-- Non-image fal.ai tasks (use `fal-ai` skill directly).
-- Simple one-off calls that OpenClaw's built-in `image_generate` already covers (you can still override the model via `model="fal/fal-ai/..."`).
+- Non-image fal tasks (use `fal-ai` skill).
+- Simple one-off that OpenClaw `image_generate` already covers perfectly (you can still pass `model="fal/..."`).
 
 ## Quick Start
 
 ```python
-from skills.fal_image import generate, edit
+from skills.fal_image import generate, generate_for_use_case, list_models
 
-# Simple generation (safety-off enforced automatically)
-result = generate("a cyberpunk cat wearing neon sunglasses, cinematic lighting")
+# Default (now flux-2-pro)
+result = generate("studio portrait of a fox, photoreal, soft lighting")
 print(result["images"][0]["url"])
 
-# Editing with reference image
-result = edit(
-    image_url="https://fal.media/files/.../cat.png",
-    prompt="make it sunset over mountains, dramatic golden hour",
-    strength=0.65
+# Use-case routing (auto or explicit)
+result = generate_for_use_case("logo_text_poster", "minimal logo for Moss AI, sans-serif, clean")
+
+# List capabilities
+print(len(list_models()))  # >= 24
+```
+
+CLI:
+```bash
+bin/fal-image generate "red apple on marble" --use-case hero_photoreal --aspect 16:9
+bin/fal-image route hero_photoreal
+bin/fal-image doctor
+bin/fal-image list --tier premium
+```
+
+## Model Registry (24+ models)
+
+| Model ID                                   | Tier     | Cost   | Key Use Cases                  | Notes |
+|--------------------------------------------|----------|--------|--------------------------------|-------|
+| fal-ai/flux-2-pro (PRIMARY)                | premium  | $0.03  | hero_photoreal, social         | New top all-rounder. 9 refs, JSON/HEX. |
+| fal-ai/flux/schnell                        | fast     | $0.003 | sketch_draft_quick             | Cheapest/fastest draft. |
+| fal-ai/flux/dev                            | balanced | $0.025 | sketch, general                | Balanced, LoRA capable. |
+| fal-ai/flux-pro/v1.1-ultra                 | premium  | $0.06  | hero_photoreal                 | High-res fallback. |
+| ideogram/v4                                | balanced | $0.03+ | logo_text_poster, transparent  | Text/logo/alpha king. |
+| fal-ai/recraft/v4/text-to-image            | balanced | $0.04  | logo, illustration             | Design-grade. |
+| fal-ai/recraft/v4/text-to-vector           | balanced | $0.08  | vector_svg_icon                | Native SVG. |
+| fal-ai/recraft/v4/pro/*                    | premium  | $0.25+ | premium brand                  | Pro raster/vector. |
+| fal-ai/gpt-image-2                         | premium  | $0.04+ | complex_text_heavy, logo       | Perfect text adherence. |
+| fal-ai/nano-banana-2 (+/edit)              | balanced | $0.08  | social_vertical, edit          | 14 refs, character consistency. |
+| krea/krea-2                                | balanced | $0.03  | illustration_anime             | Artistic, anime, painting. |
+| fal-ai/bytedance/seedream/v4.5 + v5/lite   | balanced/fast | $0.035-0.04 | hero, sketch | Web-grounded, reasoning. |
+| fal-ai/qwen-image-2 (+pro)                 | balanced/premium | $0.035-0.075 | illustration, text-heavy | Typography/infographics. |
+| fal-ai/flux-2-pro/edit + kontext*          | premium  | $0.03-0.06 | edit_modify                    | Strong editing. |
+| fal-ai/clarity-upscaler / esrgan           | balanced/fast | $0.01 / 0.005 | upscale | High-fidelity upscale. |
+| fal-ai/bria/background/remove + rembg      | balanced/fast | $0.018 / 0.001 | background_removal, sticker | Alpha removal. |
+
+Full authoritative list + metadata in `registry.py`. Prices/latency from research (2026-07-01).
+
+## Use-Case Routing (11 chains)
+
+Auto-detect + explicit:
+
+```python
+from skills.fal_image import generate_for_use_case, route_use_case, detect_use_case
+
+uc = detect_use_case("9:16 vertical story for instagram")
+model = route_use_case(uc)  # nano-banana-2 or flux-2-pro
+res = generate_for_use_case(uc, prompt)
+```
+
+Chains (verbatim research):
+- `hero_photoreal`: flux-2-pro → flux-pro/v1.1-ultra → seedream v4.5
+- `logo_text_poster`: ideogram/v4 → gpt-image-2 → recraft/v4
+- `vector_svg_icon`: recraft/v4/vector → ideogram → recraft/v3
+- `transparent_sticker`: ideogram/v4 → flux-2-pro → recraft vector
+- `sketch_draft_quick`: flux/schnell → flux/dev → seedream v5/lite
+- `social_vertical`: nano-banana-2 → flux-2-pro → seedream
+- `illustration_anime`: krea/krea-2 → recraft/v4 → qwen-2
+- `edit_modify`: flux-2-pro/edit → nano-banana-2/edit → gpt-image-2/i2i
+- `upscale`: clarity-upscaler → esrgan
+- `background_removal`: bria/remove → imageutils/rembg
+- `complex_text_heavy`: gpt-image-2 → nano-banana-pro → qwen-pro
+
+## Workflows (multi-step)
+
+```python
+from skills.fal_image.workflows import (
+    sketch_to_hero, transparent_sticker, product_shot,
+    logo_variations, illustration_set, WorkflowResult
 )
+
+wr: WorkflowResult = sketch_to_hero("quick house concept")
+print(wr.primary_url, wr.total_cost_usd, wr.models_used)
 ```
 
-## Core API
+Workflows:
+- `sketch_to_hero`: schnell → flux-2-pro → clarity
+- `transparent_sticker`: ideogram/v4 (+upscale)
+- `product_shot`: flux-2-pro → bria remove
+- `logo_variations(brand, n=4)`: recraft vector
+- `illustration_set(prompt, n=4)`: krea-2
+- `hero_photoreal` helper
 
-### `generate(prompt, model=None, **kwargs)`
-High-level generation entrypoint. Picks a sensible default model if none provided, applies safety-off, and returns the result.
+All return `WorkflowResult(output_urls, primary_url, total_cost_usd, total_latency_ms, models_used, metadata)`.
 
-### `edit(image_url, prompt, model=None, strength=0.7, **kwargs)`
-Unified image-to-image / editing interface. Automatically handles reference image upload when a local path is passed.
+## CLI Reference
 
-### `batch_generate(prompts, model=None, **kwargs)`
-Generate multiple prompts in parallel (uses `submit` + polling internally).
-
-### `variations(image_url, n=4, model=None, **kwargs)`
-Create N variations of a reference image.
-
-### Registry helpers
-- `get_model(model_id)` — full metadata for a model
-- `list_models(feature="edit")` — filter by capability
-- `choose_model(requirements)` — smart router (cost, quality, speed, max_refs, etc.)
-
-## Safety Policy (Enforced)
-Every call automatically merges:
-- `enable_safety_checker=false` (when supported)
-- `safety_tolerance=6` (maximum permissiveness)
-
-User-provided args **override** defaults when explicitly set.
-
-## Supported Models (MVP)
-
-| Model ID                        | Type     | Max Refs | Edit | Notes                          |
-|---------------------------------|----------|----------|------|--------------------------------|
-| `fal-ai/flux/schnell`           | t2i      | 0        | No   | Fastest, cheapest              |
-| `fal-ai/flux/dev`               | t2i/i2i  | 1        | Yes  | Balanced quality               |
-| `fal-ai/flux-pro/v1.1-ultra`    | t2i/i2i  | 1        | Yes  | Highest quality, premium       |
-| `fal-ai/nano-banana-2`          | edit     | 14       | Yes  | Excellent multi-ref editor     |
-| `fal-ai/ideogram/v4`            | t2i      | 0        | No   | Strong typography              |
-| `fal/krea/v2/large/text-to-image` | t2i    | 10       | No   | High creativity                |
-
-See `registry.py` for the full authoritative list and capability matrix.
-
-## File Structure
-```
-skills/fal_image/
-├── SKILL.md
-├── __init__.py          # Public API exports
-├── registry.py          # MODEL_REGISTRY + capability lookup
-├── client.py            # generate(), edit(), wrappers
-├── safety.py            # Safety-off merging (extends fal-ai/safety_off)
-├── utils.py             # upload, aspect helpers, cost stubs
-├── examples/
-│   ├── basic_generate.py
-│   ├── edit_workflow.py
-│   └── smart_router.py
-└── tests/
+```bash
+bin/fal-image generate <prompt> [--use-case X] [--model Y] [--aspect 16:9] [--output path]
+bin/fal-image edit <image> <prompt> [--model Y] [--strength 0.7]
+bin/fal-image upscale <image> [--scale 2] [--model clarity|esrgan]
+bin/fal-image remove-bg <image>
+bin/fal-image vector <prompt> [--output path.svg]
+bin/fal-image variations <image> [--n 4]
+bin/fal-image list [--feature edit] [--tier premium] [--family flux]
+bin/fal-image route <use-case>          # shows full chain
+bin/fal-image doctor                    # FAL_KEY + registry health
+bin/fal-image cost <prompt> [--use-case]
 ```
 
-## Integration with OpenClaw
-You can call via the built-in provider:
+All support `--dry-run --json`.
+
+## API Reference (key signatures)
+
+- `generate(prompt, model=None, aspect_ratio="16:9", num_images=1, **kwargs)`
+- `generate_for_use_case(use_case, prompt, **kwargs)`
+- `edit(image_url, prompt, model=None, strength=0.7, ...)`
+- `upscale(image_url, scale=2, model=None)`
+- `remove_background(image_url, model=None)`
+- `make_vector(prompt, model=None)`
+- `make_transparent(...)`
+- `batch_generate(prompts, ...)`
+- `list_models(feature=None, tier=None, family=None, use_case=None)`
+- `route_use_case(use_case, prefer_speed=False) -> str`
+- `detect_use_case(prompt) -> str`
+- `WorkflowResult(...)`
+
+See `client.py`, `router.py`, `workflows.py`, `registry.py`.
+
+## Integration with OpenClaw `image_generate`
+
 ```python
 image_generate(
     prompt="...",
-    model="fal/fal-ai/flux-pro/v1.1-ultra",
-    safety_tolerance="6"   # still respected
+    model="fal/fal-ai/flux-2-pro",   # new primary
+    aspect_ratio="16:9",
+    # safety_tolerance handled by provider + our wrappers
 )
 ```
 
-Or use the orchestrator directly for more control:
-```python
-from skills.fal_image import generate
-result = generate(prompt="...", model="fal-ai/flux-pro/v1.1-ultra")
+The `fal_image` module gives you smarter routing and advanced ops beyond the basic provider.
+
+## Safety Policy (Enforced)
+
+Every call goes through `with_safety_off` (source: `skills/fal-ai/safety_off.py`):
+- `enable_safety_checker=false`
+- `safety_tolerance="6"` (max permissive)
+
+User args override. Platform policy still applies (CSAM etc.).
+
+See `bin/fal-safety-audit`.
+
+## Test Guide
+
+```bash
+# Unit tests (no FAL_KEY needed)
+MOCK=1 pytest skills/fal_image/tests/ -v --tb=short
+
+# With coverage
+MOCK=1 pytest skills/fal_image/tests/ --cov=skills.fal_image --cov-report=term-missing
+
+# Smoke (requires FAL_KEY)
+bin/fal-image generate "red apple" --use-case hero_photoreal --output /tmp/test.png
 ```
 
-## Development Notes
-- Always import safety logic from `./safety.py` (never duplicate the mapping).
-- Registry is the single source of truth — update it when adding models.
-- Keep the public API surface small and stable.
+Target: ≥80% coverage. Mocks cover all paths.
 
----
-*Created 2026-06-19 via skill workshop proposal. MVP implementation in progress.*
+## Cost Optimization Tips (from research)
+
+- Start with `sketch_draft_quick` / schnell for iteration ($0.003).
+- Promote only winners to flux-2-pro / premium.
+- Use `num_images` batching where supported.
+- Prefer vector (recraft) for logos/icons (scalable, no extra upscale).
+- Native transparent (ideogram) avoids extra bg-remove cost.
+- Cache identical (prompt+model+seed) client-side 1h.
+- Max budget guidance: $0.15/image total across fallbacks.
+
+## Migration Notes
+
+- **Primary changed** from `fal-ai/flux/dev` → `fal-ai/flux-2-pro`.
+- Old models remain in registry for fallbacks/compat.
+- If `fal-ai/flux-2-pro` endpoint unavailable at runtime, code falls back gracefully (warn + dev).
+- Update any hard-coded "flux/dev" strings if you want the new default.
+- `openclaw.json` updated (backup taken before change).
+
+## File Structure
+
+```
+skills/fal_image/
+├── SKILL.md
+├── __init__.py
+├── registry.py          # 24+ ModelInfo + list/choose
+├── router.py            # 11 chains + detect/route
+├── client.py            # generate/edit + new high-level
+├── workflows.py         # WorkflowResult + 5 workflows
+├── safety.py            # thin re-export
+├── utils.py             # upload + improved estimate_cost
+├── examples/
+└── tests/
+    ├── conftest.py
+    ├── test_registry.py
+    ├── test_router.py
+    ├── test_safety.py
+    ├── test_client.py
+    └── test_workflows.py
+```
+
+bin/fal-image (executable)
+
+## Development Notes
+
+- Registry = single source of truth. Update when fal adds models.
+- All generation paths enforce safety via fal-ai/safety_off.
+- Keep public API stable.
+- Run tests with MOCK=1 before any commit touching this skill.
+
+Research date: 2026-07-01 (deepseek-v4-pro). 50 sources.
+
+For advanced (webhooks, realtime, video, custom serverless) use `skills/fal-ai/`.
