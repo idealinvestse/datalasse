@@ -1,0 +1,339 @@
+#!/usr/bin/env python3
+"""test-accounts: Securely manage test Gmail accounts.
+
+Passwords are Fernet-encrypted with a key stored in ~/.moss/test-accounts.key (mode 600).
+The CLI never logs plaintext passwords and masks them in list output.
+
+Subcommands:
+  add         --gmail X --password Y [--recovery Z] [--notes "..."]
+  list        [--include-inactive]
+  get         --id <id>            (shows decrypted password)
+  get         --gmail <email>      (shows decrypted password)
+  update      --id <id> [--password Y] [--recovery Z] [--notes "..."]
+  remove      --id <id>            (soft delete: is_active=0)
+  delete      --id <id>            (hard delete)
+  count
+  key-info    (fingerprint of encryption key)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE / "skills"))
+
+from cryptography.fernet import Fernet  # noqa: E402
+
+from moss_db import DatabaseManager  # noqa: E402
+
+KEY_PATH = Path("/root/.moss/test-accounts.key")
+DB_NAME = "test_accounts"
+TABLE = "gmail_test_accounts"
+
+
+def get_cipher() -> Fernet:
+    if not KEY_PATH.exists():
+        print(f"❌ Encryption key missing: {KEY_PATH}", file=sys.stderr)
+        sys.exit(1)
+    if KEY_PATH.stat().st_mode & 0o077:
+        print(f"❌ Key has bad permissions (should be 600): {KEY_PATH}", file=sys.stderr)
+        sys.exit(1)
+    return Fernet(KEY_PATH.read_text().strip().encode())
+
+
+def mask_pw(pw: str) -> str:
+    """Mask password for display: show first 2 chars + 6 stars."""
+    if not pw:
+        return ""
+    if len(pw) <= 2:
+        return "**"
+    return pw[:2] + "*" * min(6, len(pw) - 2)
+
+
+def cmd_add(args, db, cipher):
+    gmail = args.gmail
+    password = args.password
+    recovery = args.recovery
+    notes = args.notes
+    if not gmail or not password:
+        print("❌ --gmail and --password required", file=sys.stderr)
+        return 1
+    enc = cipher.encrypt(password.encode())
+    pw_preview = mask_pw(password)
+    try:
+        with db.mariadb() as conn:
+            cur = conn.execute(
+                "INSERT INTO gmail_test_accounts (gmail, password_encrypted, recovery_email, notes) "
+                "VALUES (%s, %s, %s, %s)",
+                (gmail, enc, recovery, notes),
+            )
+            new_id = cur.last_id
+            conn.commit()
+    except Exception as e:
+        print(f"❌ Insert failed: {e}", file=sys.stderr)
+        return 1
+    # Show only masked password + id + recovery — never plaintext
+    print(f"✅ Added: id={new_id} gmail={gmail} password={pw_preview} recovery={recovery or '-'}")
+    return 0
+
+
+def cmd_list(args, db, _cipher):
+    include_inactive = args.include_inactive
+    where = "" if include_inactive else "WHERE is_active = 1"
+    with db.mariadb() as conn:
+        r = conn.execute(
+            f"SELECT id, gmail, recovery_email, notes, is_active, created_at "
+            f"FROM {TABLE} {where} ORDER BY id DESC"
+        )
+        rows = r.rows
+    if not rows:
+        print("(no accounts)")
+        return 0
+    print(f"{'ID':<5} {'Gmail':<35} {'Recovery':<35} {'Active':<7} {'Created':<20} {'Notes'}")
+    print("-" * 130)
+    for r in rows:
+        active = "yes" if r["is_active"] else "NO"
+        notes_short = (r["notes"] or "")[:30]
+        print(
+            f"{r['id']:<5} {r['gmail']:<35} {(r['recovery_email'] or '-'):<35} "
+            f"{active:<7} {str(r['created_at']):<20} {notes_short}"
+        )
+    print(f"\n{len(rows)} accounts. Use `get` to see decrypted password.")
+    return 0
+
+
+def cmd_get(args, db, cipher):
+    if not args.id and not args.gmail:
+        print("❌ --id or --gmail required", file=sys.stderr)
+        return 1
+    if args.id:
+        where = "WHERE id = %s"
+        param = (args.id,)
+    else:
+        where = "WHERE gmail = %s"
+        param = (args.gmail,)
+    with db.mariadb() as conn:
+        r = conn.execute(
+            f"SELECT id, gmail, password_encrypted, recovery_email, notes, is_active, created_at "
+            f"FROM {TABLE} {where}",
+            param,
+        )
+        rows = r.rows
+    if not rows:
+        print("❌ Not found", file=sys.stderr)
+        return 1
+    for row in rows:
+        try:
+            pw = cipher.decrypt(bytes(row["password_encrypted"])).decode()
+        except Exception as e:
+            print(f"❌ Decrypt failed for id={row['id']}: {e}", file=sys.stderr)
+            continue
+        print(f"ID:           {row['id']}")
+        print(f"Gmail:        {row['gmail']}")
+        print(f"Password:     {pw}")
+        print(f"Recovery:     {row['recovery_email'] or '-'}")
+        print(f"Notes:        {row['notes'] or '-'}")
+        print(f"Active:       {'yes' if row['is_active'] else 'NO'}")
+        print(f"Created:      {row['created_at']}")
+    return 0
+
+
+def cmd_update(args, db, cipher):
+    if not args.id:
+        print("❌ --id required", file=sys.stderr)
+        return 1
+    fields = []
+    params = []
+    if args.password is not None:
+        enc = cipher.encrypt(args.password.encode())
+        fields.append("password_encrypted = %s")
+        params.append(enc)
+    if args.recovery is not None:
+        fields.append("recovery_email = %s")
+        params.append(args.recovery)
+    if args.notes is not None:
+        fields.append("notes = %s")
+        params.append(args.notes)
+    if args.active is not None:
+        fields.append("is_active = %s")
+        params.append(1 if args.active else 0)
+    if not fields:
+        print("❌ Nothing to update (--password, --recovery, --notes, --active)", file=sys.stderr)
+        return 1
+    params.append(args.id)
+    with db.mariadb() as conn:
+        r = conn.execute(
+            f"UPDATE {TABLE} SET {', '.join(fields)} WHERE id = %s",
+            tuple(params),
+        )
+        conn.commit()
+    print(f"✅ Updated id={args.id} ({r.rowcount} row(s))")
+    return 0
+
+
+def cmd_remove(args, db, _cipher):
+    if not args.id:
+        print("❌ --id required", file=sys.stderr)
+        return 1
+    with db.mariadb() as conn:
+        r = conn.execute(
+            f"UPDATE {TABLE} SET is_active = 0 WHERE id = %s", (args.id,)
+        )
+        conn.commit()
+    print(f"✅ Soft-deleted id={args.id} ({r.rowcount} row(s))")
+    return 0
+
+
+def cmd_delete(args, db, _cipher):
+    if not args.id:
+        print("❌ --id required", file=sys.stderr)
+        return 1
+    if not args.yes:
+        print("⚠️ Use --yes to confirm hard delete", file=sys.stderr)
+        return 1
+    with db.mariadb() as conn:
+        r = conn.execute(f"DELETE FROM {TABLE} WHERE id = %s", (args.id,))
+        conn.commit()
+    print(f"✅ Hard-deleted id={args.id} ({r.rowcount} row(s))")
+    return 0
+
+
+def cmd_count(args, db, _cipher):
+    with db.mariadb() as conn:
+        r = conn.execute(f"SELECT COUNT(*) AS c FROM {TABLE}")
+        total = r.rows[0]["c"] if r.rows else 0
+        r2 = conn.execute(f"SELECT COUNT(*) AS c FROM {TABLE} WHERE is_active = 1")
+        active = r2.rows[0]["c"] if r2.rows else 0
+    print(f"Total:  {total}")
+    print(f"Active: {active}")
+    return 0
+
+
+def cmd_key_info(args, _db, _cipher):
+    import hashlib
+    key = KEY_PATH.read_text().strip().encode()
+    fp = hashlib.sha256(key).hexdigest()[:16]
+    perms = oct(KEY_PATH.stat().st_mode)[-3:]
+    print(f"Key path:  {KEY_PATH}")
+    print(f"Key SHA:   {fp}…")
+    print(f"Perms:     {perms} (must be 600)")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Secure test Gmail account manager")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_add = sub.add_parser("add", help="Add a new account")
+    p_add.add_argument("--gmail", required=True)
+    p_add.add_argument("--password", required=True)
+    p_add.add_argument("--recovery")
+    p_add.add_argument("--notes")
+
+    p_list = sub.add_parser("list", help="List all accounts (passwords masked)")
+    p_list.add_argument("--include-inactive", action="store_true")
+
+    p_get = sub.add_parser("get", help="Get account (decrypts password)")
+    p_get_id = p_get.add_mutually_exclusive_group(required=True)
+    p_get_id.add_argument("--id", type=int)
+    p_get_id.add_argument("--gmail")
+
+    p_upd = sub.add_parser("update", help="Update account fields")
+    p_upd.add_argument("--id", type=int, required=True)
+    p_upd.add_argument("--password")
+    p_upd.add_argument("--recovery")
+    p_upd.add_argument("--notes")
+    p_upd.add_argument("--active", type=int, choices=[0, 1])
+
+    p_rm = sub.add_parser("remove", help="Soft delete (is_active=0)")
+    p_rm.add_argument("--id", type=int, required=True)
+
+    p_del = sub.add_parser("delete", help="HARD delete (irreversible)")
+    p_del.add_argument("--id", type=int, required=True)
+    p_del.add_argument("--yes", action="store_true")
+
+    sub.add_parser("count", help="Show total + active counts")
+    sub.add_parser("key-info", help="Show encryption key fingerprint")
+
+    args = parser.parse_args()
+
+    cipher = get_cipher()
+    db = DatabaseManager.from_env()
+    # Override default database name (moss_main) → test_accounts
+    from moss_db.mariadb import _connect_mariadb
+    # Patch the connection to use test_accounts DB
+
+    # Use raw pymysql via same wrapper pattern as kill-tony migration
+    import pymysql
+    import contextlib
+    creds = {}
+    if Path("/root/.moss/db-credentials.env").exists():
+        for line in Path("/root/.moss/db-credentials.env").read_text().splitlines():
+            if line.startswith("MOSS_MARIADB_") and "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip().strip("'").strip('"').rstrip("***")
+                creds[k] = v
+    raw_conn = pymysql.connect(
+        host=creds.get("MOSS_MARIADB_HOST", "127.0.0.1"),
+        port=int(creds.get("MOSS_MARIADB_PORT", 3306)),
+        user=creds.get("MOSS_MARIADB_USER", "moss"),
+        password=creds.get("MOSS_MARIADB_PASSWORD", ""),
+        database=DB_NAME,
+        charset="utf8mb4",
+    )
+
+    class _R:
+        def __init__(self, rows=None, last_id=None, rowcount=0):
+            self.rows = rows or []
+            self.last_id = last_id
+            self.rowcount = rowcount
+
+    class _DBConn:
+        def __init__(self, c): self._c = c
+        def execute(self, sql, params=()):
+            cur = self._c.cursor()
+            if params and isinstance(params, list) and isinstance(params[0], (tuple, list)):
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
+            rowcount = cur.rowcount
+            last_id = cur.lastrowid
+            rows = []
+            try:
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception:
+                pass
+            return _R(rows=rows, last_id=last_id, rowcount=rowcount)
+        def commit(self): self._c.commit()
+        def rollback(self): self._c.rollback()
+        def close(self): self._c.close()
+
+    @contextlib.contextmanager
+    def kt():
+        yield _DBConn(raw_conn)
+
+    db.mariadb = kt
+
+    handlers = {
+        "add": cmd_add,
+        "list": cmd_list,
+        "get": cmd_get,
+        "update": cmd_update,
+        "remove": cmd_remove,
+        "delete": cmd_delete,
+        "count": cmd_count,
+        "key-info": cmd_key_info,
+    }
+    try:
+        return handlers[args.cmd](args, db, cipher)
+    finally:
+        raw_conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
