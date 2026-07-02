@@ -272,12 +272,20 @@ def main():
         migrate_guests(db, sqlite_conn)
         migrate_segments(db, sqlite_conn)
         
+        # CRITICAL: Commit transaction so data persists!
+        conn.commit()
+        print("\n✅ All migrations done + transaction committed")
+        
         if verify(db, sqlite_conn):
             print("\n✅ Migration complete + verified!")
             return 0
         else:
             print("\n⚠️ Migration complete but counts don't match exactly")
             return 1
+    except Exception as e:
+        conn.rollback()
+        print(f"\n❌ Migration failed, rolled back: {e}")
+        raise
     finally:
         sqlite_conn.close()
         conn.close()
