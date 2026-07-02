@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""moss-wallet-init-auto: Non-interactive BTC wallet init.
+
+Reads passphrase from MOSSWALLET_PASSPHRASE env var or /tmp/mosswallet-pw.txt.
+Generates a new wallet, encrypts it, derives first addresses, and saves config.
+"""
+import getpass
+import os
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE))
+sys.path.insert(0, str(WORKSPACE / "skills"))
+
+from moss_wallet import (
+    generate_mnemonic,
+    encrypt_mnemonic,
+    save_keystore,
+    save_config,
+    derive_first_addresses,
+    is_keystore_present,
+    write_audit,
+    WALLET_BASE,
+)
+from moss_wallet.hd import derive_address
+
+
+def print_addresses(addrs, count=5):
+    for atype in ("legacy", "segwit", "taproot"):
+        print(f"\n{atype.upper()}:")
+        for i, a in enumerate(addrs[atype][:count]):
+            print(f"  [{i}] {a}")
+
+
+def main():
+    pw = os.environ.get("MOSSWALLET_PASSPHRASE", "")
+    if not pw:
+        pwfile = Path("/tmp/mosswallet-pw.txt")
+        if pwfile.exists():
+            pw = pwfile.read_text().strip()
+    if not pw:
+        print("❌ Passphrase required: set MOSSWALLET_PASSPHRASE or create /tmp/mosswallet-pw.txt", file=sys.stderr)
+        return 1
+
+    if is_keystore_present():
+        print("❌ Keystore already exists. Use restore or remove manually.", file=sys.stderr)
+        return 1
+
+    net = "testnet" if "--testnet" in sys.argv else "mainnet"
+    mnemonic = generate_mnemonic()
+    print("\n=== NEW WALLET MNEMONIC (24 ord) — WRITE DOWN NOW ===\n")
+    print(mnemonic)
+    print("\n=== FIRST ADDRESSES (for verification) ===")
+    addrs = derive_first_addresses(mnemonic, 5, net)
+    print_addresses(addrs, 5)
+
+    enc = encrypt_mnemonic(mnemonic, pw)
+    save_keystore(enc)
+    save_config({"network": net, "last_receive_index": 0})
+    write_audit("init", f"net=mainnet")
+
+    print(f"\n✅ Wallet initierad ({net}). Keystore: {WALLET_BASE / 'keystore.enc'}")
+    print(f"   Default receiving address (SegWit): {addrs['segwit'][0]}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
