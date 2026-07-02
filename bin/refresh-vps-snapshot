@@ -51,6 +51,7 @@ mem = d.get("memory", {})
 avail = mem.get("avail_kb", 1)
 total = mem.get("total_kb", 1)
 used_pct = 100 * (1 - avail/total) if total else 0
+avail_mb = avail / 1024
 disk = d.get("disk", [])
 disk_pct = max((m.get("pct", 0) for m in disk), default=0)
 load = d.get("cpu", {}).get("load", {}).get("1", 0)
@@ -63,8 +64,30 @@ if disk_pct >= 95:   issues.append(f"DISK {disk_pct}%")
 if load > 2 * nproc: issues.append(f"LOAD {load:.1f}>2x nproc")
 if svc_fail > 0:     issues.append(f"{svc_fail} failed svc")
 print("ALERT: " + ", ".join(issues) if issues else "OK")
+
+# 3b. Graduated memory level (4 tiers) — printed to stderr-like for capture
+# OK         < 80% used  AND  > 1.5 GB free
+# warning    80-89% used OR    1.0-1.5 GB free
+# high       90-94% used OR    0.5-1.0 GB free
+# critical   >= 95% used OR    < 0.5 GB free
+if used_pct >= 95 or avail_mb < 500:
+    mem_level = "critical"
+elif used_pct >= 90 or avail_mb < 1024:
+    mem_level = "high"
+elif used_pct >= 80 or avail_mb < 1536:
+    mem_level = "warning"
+else:
+    mem_level = "ok"
+print(f"MEM_LEVEL={mem_level} used={used_pct:.0f}% avail={avail_mb:.0f}MB")
 PYEOF
 )
+
+# 3c. Extract memory level + previous state for change-detection
+MEM_LEVEL=$(echo "$ALERT_LINE" | grep -oE 'MEM_LEVEL=[a-z]+' | tail -1 | cut -d= -f2)
+MEM_USED=$(echo "$ALERT_LINE" | grep -oE 'used=[0-9.]+%' | tail -1 | cut -d= -f2)
+MEM_AVAIL=$(echo "$ALERT_LINE" | grep -oE 'avail=[0-9.]+MB' | tail -1 | cut -d= -f2)
+# Strip the MEM_LEVEL line from ALERT_LINE so STATUS.md stays clean
+ALERT_LINE=$(echo "$ALERT_LINE" | grep -v "^MEM_LEVEL=")
 
 # 4. Compose MD
 {
@@ -102,6 +125,28 @@ if [[ "$ALERT_LINE" == ALERT:* && "$PREV" == "OK" ]]; then
   echo "[$TS] ALERT raised: $ALERT_LINE" >> "$WORKSPACE_DIR/.vps-alert-log"
 elif [[ "$ALERT_LINE" == "OK" && "$PREV" != "OK" ]]; then
   echo "[$TS] ALERT cleared (was: $PREV)" >> "$WORKSPACE_DIR/.vps-alert-log"
+fi
+
+# 7. Graduated memory alerts (state-change only, separate log)
+MEM_STATE="$WORKSPACE_DIR/.vps-memory-state"
+MEM_LOG="$WORKSPACE_DIR/.vps-memory-alert-log"
+MEM_PREV="ok"
+[[ -f "$MEM_STATE" ]] && MEM_PREV=$(cat "$MEM_STATE" 2>/dev/null || echo "ok")
+echo "$MEM_LEVEL" > "$MEM_STATE"
+if [[ "$MEM_LEVEL" != "$MEM_PREV" ]]; then
+  # Pick icon + recommended action per level
+  case "$MEM_LEVEL" in
+    ok)       ICON="✅"; MSG="Memory back to normal ($MEM_USED used, $MEM_AVAIL free)";;
+    warning)  ICON="⚠️"; MSG="Memory getting tight: $MEM_USED used, $MEM_AVAIL free. Consider scaling up VPS in 1-2 weeks.";;
+    high)     ICON="🔶"; MSG="Memory HIGH: $MEM_USED used, $MEM_AVAIL free. **Scale up VPS soon** (kill heavy services, or upgrade RAM).";;
+    critical) ICON="🔴"; MSG="Memory CRITICAL: $MEM_USED used, $MEM_AVAIL free. **Scale up VPS NOW** (OOM kill imminent).";;
+    *)        ICON="·"; MSG="Memory level: $MEM_LEVEL";;
+  esac
+  if command -v openclaw >/dev/null 2>&1; then
+    openclaw message send --channel telegram --target 438805461 \
+      --message "$ICON Memory alert: $MSG" >/dev/null 2>&1 || true
+  fi
+  echo "[$TS] MEM $MEM_PREV → $MEM_LEVEL: $MEM_USED used, $MEM_AVAIL free" >> "$MEM_LOG"
 fi
 
 exit 0
