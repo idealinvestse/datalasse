@@ -1,0 +1,287 @@
+#!/usr/bin/env python3
+"""migrate-killtony-to-mossdb: Migrate kill-tony data from SQLite to MariaDB.
+
+Reads from data/kill-tony/kill_tony.db (SQLite) and writes to MariaDB kill_tony database
+using the moss-db wrapper. Idempotent: skips rows that already exist (by id).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import sqlite3
+import sys
+from datetime import datetime
+from email.utils import parsedate_to_datetime
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE / "skills"))
+
+from moss_db import DatabaseManager  # noqa: E402
+import pymysql
+
+SQLITE_PATH = WORKSPACE / "data" / "kill-tony" / "kill_tony.db"
+BATCH_SIZE = 1000
+
+
+def _to_datetime(s):
+    """Parse RFC 2822 / ISO 8601 / SQLite timestamps → MySQL DATETIME."""
+    if not s:
+        return None
+    if isinstance(s, (int, float)):
+        try:
+            return datetime.fromtimestamp(s).strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return None
+    s = str(s).strip()
+    if not s:
+        return None
+    # RFC 2822 (e.g. "Tue, 30 Jun 2026 01:00:00 +0000")
+    try:
+        dt = parsedate_to_datetime(s)
+        if dt:
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    # ISO 8601
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    # Already MySQL format?
+    return s
+
+
+def migrate_episodes(db, sqlite_conn):
+    """Migrate episodes table (767 rows)."""
+    print("📺 Migrating episodes...")
+    cur = sqlite_conn.execute("SELECT * FROM episodes")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    
+    inserted = 0
+    skipped = 0
+    with db.mariadb() as conn:
+        for row in rows:
+            d = dict(zip(cols, row))
+            # Convert booleans, datetimes
+            d["analyzed"] = bool(d.get("analyzed"))
+            
+            # Check if exists
+            existing = conn.execute("SELECT id FROM episodes WHERE id = %s", (d["id"],)).fetchall()
+            if existing:
+                skipped += 1
+                continue
+            
+            # Insert
+            conn.execute("""
+                INSERT INTO episodes (id, episode_number, title, pub_date, duration_seconds,
+                    audio_url, description, guid, downloaded_path, transcript_path,
+                    analyzed, analysis_json, cost_usd, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                d["id"], d["episode_number"], d["title"], _to_datetime(d["pub_date"]),
+                d["duration_seconds"], d["audio_url"], d["description"], d["guid"],
+                d["downloaded_path"], d["transcript_path"],
+                1 if d["analyzed"] else 0,
+                json.dumps(d["analysis_json"]) if d.get("analysis_json") else None,
+                d["cost_usd"], _to_datetime(d["created_at"]), _to_datetime(d["updated_at"]),
+            ))
+            inserted += 1
+    print(f"  ✅ {inserted} inserted, {skipped} skipped (already exists)")
+
+
+def migrate_highlights(db, sqlite_conn):
+    """Migrate analysis_highlights (89 rows)."""
+    print("🌟 Migrating analysis_highlights...")
+    cur = sqlite_conn.execute("SELECT * FROM analysis_highlights")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    
+    inserted = 0
+    skipped = 0
+    with db.mariadb() as conn:
+        for row in rows:
+            d = dict(zip(cols, row))
+            existing = conn.execute("SELECT id FROM analysis_highlights WHERE id = %s", (d["id"],)).fetchall()
+            if existing:
+                skipped += 1
+                continue
+            conn.execute("""
+                INSERT INTO analysis_highlights (id, episode_id, category, timestamp_start, description)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (d["id"], d["episode_id"], d["category"], d["timestamp_start"], d["description"]))
+            inserted += 1
+    print(f"  ✅ {inserted} inserted, {skipped} skipped")
+
+
+def migrate_guests(db, sqlite_conn):
+    """Migrate analysis_guests (279 rows)."""
+    print("👥 Migrating analysis_guests...")
+    cur = sqlite_conn.execute("SELECT * FROM analysis_guests")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    
+    inserted = 0
+    skipped = 0
+    with db.mariadb() as conn:
+        for row in rows:
+            d = dict(zip(cols, row))
+            existing = conn.execute("SELECT id FROM analysis_guests WHERE id = %s", (d["id"],)).fetchall()
+            if existing:
+                skipped += 1
+                continue
+            conn.execute("""
+                INSERT INTO analysis_guests (id, episode_id, name, role, notes)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (d["id"], d["episode_id"], d["name"], d["role"], d["notes"]))
+            inserted += 1
+    print(f"  ✅ {inserted} inserted, {skipped} skipped")
+
+
+def migrate_segments(db, sqlite_conn):
+    """Migrate transcript_segments (60,128 rows) — batched."""
+    print("📝 Migrating episode_segments (60k rows, batched)...")
+    cur = sqlite_conn.execute("SELECT * FROM transcript_segments")
+    cols = [d[0] for d in cur.description]
+    rows = cur.fetchall()
+    
+    inserted = 0
+    with db.mariadb() as conn:
+        for i, row in enumerate(rows):
+            d = dict(zip(cols, row))
+            try:
+                conn.execute("""
+                    INSERT IGNORE INTO episode_segments (id, episode_id, chunk_index, start_time, end_time, text)
+                    VALUES (%s, %s, %s, %s, %s, %s)
+                """, (d["id"], d["episode_id"], d["chunk_index"], d["start_time"], d["end_time"], d["text"]))
+                inserted += 1
+            except Exception as e:
+                print(f"  ⚠️ segment {d['id']}: {e}")
+            if (i + 1) % 10000 == 0:
+                print(f"  ... {i+1}/{len(rows)} processed ({inserted} inserted)")
+    
+    print(f"  ✅ ~{inserted} inserted (duplicates ignored via INSERT IGNORE)")
+
+
+def verify(db, sqlite_conn):
+    """Verify row counts match."""
+    print("\n🔍 Verifying...")
+    
+    counts_sqlite = {
+        "episodes": sqlite_conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
+        "analysis_highlights": sqlite_conn.execute("SELECT COUNT(*) FROM analysis_highlights").fetchone()[0],
+        "analysis_guests": sqlite_conn.execute("SELECT COUNT(*) FROM analysis_guests").fetchone()[0],
+        "episode_segments": sqlite_conn.execute("SELECT COUNT(*) FROM transcript_segments").fetchone()[0],
+    }
+    
+    counts_mariadb = {}
+    with db.mariadb() as conn:
+        for tbl in counts_sqlite:
+            r = conn.execute(f"SELECT COUNT(*) AS c FROM {tbl}")
+            # r.rows is a list of dicts
+            if r.rows:
+                counts_mariadb[tbl] = r.rows[0].get("c", 0) if isinstance(r.rows[0], dict) else r.rows[0][0]
+            else:
+                counts_mariadb[tbl] = 0
+    
+    print(f"  {'Table':<25} {'SQLite':>8} {'MariaDB':>8} {'Match':>8}")
+    print(f"  {'-'*25} {'-'*8} {'-'*8} {'-'*8}")
+    all_ok = True
+    for tbl in counts_sqlite:
+        ok = counts_sqlite[tbl] == counts_mariadb[tbl]
+        if not ok:
+            all_ok = False
+        print(f"  {tbl:<25} {counts_sqlite[tbl]:>8} {counts_mariadb[tbl]:>8} {'✅' if ok else '❌':>8}")
+    
+    return all_ok
+
+
+def main():
+    if not SQLITE_PATH.exists():
+        print(f"❌ SQLite not found: {SQLITE_PATH}")
+        sys.exit(1)
+    
+    print(f"📂 SQLite: {SQLITE_PATH}")
+    print(f"🎯 MariaDB: kill_tony @ 127.0.0.1:3306 (moss user)")
+    print()
+    
+    sqlite_conn = sqlite3.connect(str(SQLITE_PATH))
+    # Open dedicated connection to kill_tony database (bypass moss_db default)
+    creds = {}
+    if Path("/root/.moss/db-credentials.env").exists():
+        for line in Path("/root/.moss/db-credentials.env").read_text().splitlines():
+            if line.startswith("MOSS_MARIADB_") and "=" in line:
+                k, v = line.split("=", 1)
+                v = v.strip().strip("'").strip('"').rstrip("***")
+                creds[k] = v
+    conn = pymysql.connect(
+        host=creds.get("MOSS_MARIADB_HOST", "127.0.0.1"),
+        port=int(creds.get("MOSS_MARIADB_PORT", 3306)),
+        user=creds.get("MOSS_MARIADB_USER", "moss"),
+        password=creds.get("MOSS_MARIADB_PASSWORD", ""),
+        database="kill_tony",
+        charset="utf8mb4",
+    )
+    db = DatabaseManager.from_env()
+    
+    # Monkey-patch the kill_tony connect so the migrate_* functions use it
+    class _R:
+        def __init__(self, rows=None, last_id=None, rowcount=0):
+            self.rows = rows or []
+            self.last_id = last_id
+            self.rowcount = rowcount
+        def fetchall(self): return self.rows
+        def fetchone(self): return self.rows[0] if self.rows else None
+    
+    class _KillTonyConn:
+        def __init__(self, c): self._c = c
+        def execute(self, sql, params=()):
+            cur = self._c.cursor()
+            # If params is a list of tuples, use executemany (batch)
+            if params and isinstance(params, list) and isinstance(params[0], (tuple, list)):
+                cur.executemany(sql, params)
+            else:
+                cur.execute(sql, params)
+            rowcount = cur.rowcount
+            last_id = cur.lastrowid
+            rows = []
+            try:
+                if cur.description:
+                    cols = [d[0] for d in cur.description]
+                    rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            except Exception:
+                pass
+            return _R(rows=rows, last_id=last_id, rowcount=rowcount)
+        def commit(self): self._c.commit()
+        def rollback(self): self._c.rollback()
+        def close(self): self._c.close()
+    
+    # Provide a context manager
+    import contextlib
+    @contextlib.contextmanager
+    def kt_conn():
+        yield _KillTonyConn(conn)
+    # Temporarily replace db.mariadb for migrate_* functions
+    db.mariadb = kt_conn
+    
+    try:
+        migrate_episodes(db, sqlite_conn)
+        migrate_highlights(db, sqlite_conn)
+        migrate_guests(db, sqlite_conn)
+        migrate_segments(db, sqlite_conn)
+        
+        if verify(db, sqlite_conn):
+            print("\n✅ Migration complete + verified!")
+            return 0
+        else:
+            print("\n⚠️ Migration complete but counts don't match exactly")
+            return 1
+    finally:
+        sqlite_conn.close()
+        conn.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
