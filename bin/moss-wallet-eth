@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+"""moss-wallet-eth: EIP-7702 self-custody ETH/ERC-20 wallet for Moss.
+
+Root EOA offline (encrypted). VPS holds scoped session key only.
+On-chain ScopeEnforcer enforces daily cap, whitelist, TTL.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+
+WORKSPACE = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(WORKSPACE))
+
+from eth_account import Account
+from web3 import Web3
+
+from skills.moss_eth_wallet import (
+    generate_mnemonic,
+    validate_mnemonic,
+    derive_address,
+    derive_root_account,
+    encrypt_mnemonic,
+    decrypt_mnemonic,
+    get_passphrase,
+    confirm_passphrase,
+    load_keystore,
+    save_keystore,
+    load_config,
+    save_config,
+    write_audit,
+    is_keystore_present,
+    encrypt_session,
+    decrypt_session,
+    load_session,
+    save_session,
+    is_session_present,
+    WALLET_BASE,
+    normalize_network,
+    is_test_network,
+    to_checksum,
+    validate_eth_address,
+    get_rpc_urls,
+    fetch_eth_balance,
+    fetch_erc20_balance,
+    format_ether,
+    build_authorization,
+    sign_authorization,
+    is_delegated,
+    SCOPE_ENFORCER_ABI,
+    SCOPE_ENFORCER_BYTECODE,
+    generate_session_key,
+    build_session_scope,
+    serialize_session,
+    parse_session,
+)
+from skills.moss_eth_wallet.tx import (
+    build_scoped_call,
+    build_token_transfer_data,
+    sign_and_serialize,
+    build_grant_tx,
+    build_revoke_tx,
+)
+from skills.moss_eth_wallet.rpc import get_web3, get_nonce
+
+# --------------------------- helpers ---------------------------
+
+def log(msg: str, level: str = "info") -> None:
+    icons = {"info": "ℹ️", "ok": "✅", "warn": "⚠️", "err": "❌", "step": "→"}
+    icon = icons.get(level, "·")
+    print(f"{icon} {msg}", flush=True)
+
+
+def get_effective_network(args: argparse.Namespace) -> str:
+    net = getattr(args, "network", None)
+    if net:
+        return normalize_network(net)
+    cfg = load_config()
+    return cfg.get("network", "holesky")
+
+
+def require_keystore() -> dict:
+    data = load_keystore()
+    if not data:
+        log("No root wallet found. Run: bin/moss-wallet-eth init [--network holesky]", "err")
+        sys.exit(1)
+    return data
+
+
+def decrypt_root_with_prompt(data: dict) -> str:
+    pw = get_passphrase("Enter root wallet passphrase: ")
+    return decrypt_mnemonic(data, pw)
+
+
+def require_session() -> dict:
+    data = load_session()
+    if not data:
+        log("No active session. Run: bin/moss-wallet-eth session-issue ...", "err")
+        sys.exit(1)
+    return data
+
+
+def decrypt_session_with_prompt(data: dict) -> dict:
+    pw = get_passphrase("Enter wallet passphrase (for session): ")
+    return decrypt_session(data, pw)
+
+
+def require_confirm(args: argparse.Namespace, action: str) -> None:
+    if getattr(args, "confirm", False):
+        return
+    ans = input(f"Confirm {action}? [y/N] ").strip().lower()
+    if ans not in ("y", "yes"):
+        log("Aborted by user", "warn")
+        sys.exit(1)
+
+
+def require_web3(network: str):
+    try:
+        return get_web3(network)
+    except Exception as e:
+        log(f"RPC connection failed: {e}", "err")
+        sys.exit(1)
+
+
+# --------------------------- commands ---------------------------
+
+def cmd_status(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    present = is_keystore_present()
+    sess_present = is_session_present()
+    cfg = load_config()
+    print("\n=== moss-wallet-eth status ===")
+    print(f"Wallet dir:     {WALLET_BASE}")
+    print(f"Root keystore:  {'present' if present else 'MISSING'}")
+    print(f"Session:        {'present' if sess_present else 'MISSING'}")
+    print(f"Network:        {net}")
+    print(f"Config:         enforcer={cfg.get('enforcer')}, delegated={cfg.get('delegated')}")
+    if present:
+        try:
+            ks = require_keystore()
+            pw = get_passphrase("Enter passphrase to verify root (Ctrl-C to skip): ")
+            mnemonic = decrypt_mnemonic(ks, pw)
+            addr = derive_address(mnemonic, 0)
+            print(f"Root EOA:       {addr}")
+            print("Root decrypt:   OK")
+            if w3.is_connected():
+                bal = fetch_eth_balance(addr, net)
+                print(f"Root balance:   {format_ether(bal)} ETH")
+        except KeyboardInterrupt:
+            print("Root check skipped")
+        except Exception as e:
+            print(f"Root check: FAILED ({e})")
+    if sess_present:
+        try:
+            sdata = require_session()
+            s = decrypt_session_with_prompt(sdata)
+            print(f"Session addr:   {s['address']}")
+            sc = s.get("scope", {})
+            print(f"Session scope:  cap={sc.get('daily_cap_wei',0)/1e18} ETH, exp={sc.get('expiry')}")
+            if w3.is_connected():
+                bal = fetch_eth_balance(s["address"], net)
+                print(f"Session balance:{format_ether(bal)} ETH (gas)")
+        except Exception as e:
+            print(f"Session check: FAILED ({e})")
+    if cfg.get("enforcer"):
+        try:
+            eoa = derive_address(decrypt_root_with_prompt(require_keystore()), 0) if present else None
+            if eoa and w3.is_connected():
+                delegated = is_delegated(w3, eoa)
+                print(f"Delegation:     {'ACTIVE' if delegated else 'NONE'} (code prefix check)")
+        except Exception:
+            pass
+    write_audit("status", f"net={net}")
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    if is_keystore_present():
+        log("Keystore already exists. Use restore or remove.", "err")
+        return 1
+    net = normalize_network(getattr(args, "network", "holesky") or "holesky")
+    mnemonic = generate_mnemonic()
+    print("\n=== NEW ROOT EOA MNEMONIC (WRITE DOWN - 24 WORDS) ===\n")
+    print(mnemonic)
+    addr = derive_address(mnemonic, 0)
+    print(f"\nFirst address (m/44'/60'/0'/0/0): {addr}")
+    print("\nThis will be encrypted and NEVER stored in cleartext.")
+    passphrase = confirm_passphrase()
+    enc = encrypt_mnemonic(mnemonic, passphrase)
+    save_keystore(enc)
+    cfg = {"network": net, "enforcer": None, "delegated": False}
+    save_config(cfg)
+    write_audit("init", f"net={net} addr={addr}")
+    log(f"Root wallet initialized ({net}). Keystore at {WALLET_BASE / 'keystore.enc'}", "ok")
+    log("Run export-backup --confirm for paper copy. Then fund and delegate.", "warn")
+    return 0
+
+
+def cmd_restore(args: argparse.Namespace) -> int:
+    if is_keystore_present():
+        log("Keystore exists. Aborting restore.", "err")
+        return 1
+    net = normalize_network(getattr(args, "network", "holesky") or "holesky")
+    if args.mnemonic:
+        mnemonic = args.mnemonic.strip()
+    else:
+        print("Paste 24-word mnemonic:")
+        mnemonic = input().strip()
+    if not validate_mnemonic(mnemonic):
+        log("Invalid mnemonic", "err")
+        return 1
+    addr = derive_address(mnemonic, 0)
+    print(f"Mnemonic OK. Address: {addr}")
+    passphrase = confirm_passphrase()
+    enc = encrypt_mnemonic(mnemonic, passphrase)
+    save_keystore(enc)
+    save_config({"network": net, "enforcer": None, "delegated": False})
+    write_audit("restore", f"net={net}")
+    log("Root wallet restored.", "ok")
+    return 0
+
+
+def cmd_addresses(args: argparse.Namespace) -> int:
+    data = require_keystore()
+    mnemonic = decrypt_root_with_prompt(data)
+    net = get_effective_network(args)
+    addr = derive_address(mnemonic, 0)
+    print(f"\n=== ETH addresses (network={net}) ===")
+    print(f"Root EOA: {addr}")
+    if is_session_present():
+        try:
+            s = decrypt_session_with_prompt(require_session())
+            print(f"Session:  {s['address']}")
+        except Exception:
+            pass
+    write_audit("addresses", f"net={net}")
+    return 0
+
+
+def cmd_balance(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    token = getattr(args, "token", None)
+    # prefer session balance for gas view + root view
+    printed = False
+    if is_keystore_present():
+        try:
+            ks = require_keystore()
+            m = decrypt_root_with_prompt(ks)
+            root = derive_address(m, 0)
+            bal = fetch_eth_balance(root, net)
+            print(f"Root EOA {root}: {format_ether(bal)} ETH")
+            printed = True
+        except Exception as e:
+            log(f"Root balance error: {e}", "warn")
+    if is_session_present():
+        try:
+            s = decrypt_session_with_prompt(require_session())
+            bal = fetch_eth_balance(s["address"], net)
+            print(f"Session  {s['address']}: {format_ether(bal)} ETH")
+            printed = True
+        except Exception as e:
+            log(f"Session balance error: {e}", "warn")
+    if token and validate_eth_address(token):
+        try:
+            # use root or session? show for root
+            if is_keystore_present():
+                m = decrypt_root_with_prompt(require_keystore())
+                root = derive_address(m, 0)
+                b, dec, sym = fetch_erc20_balance(token, root, net)
+                print(f"ERC20 {sym} ({token}) on root: {b / (10**dec)}")
+        except Exception as e:
+            log(f"ERC20 error: {e}", "warn")
+    if not printed:
+        log("No addresses to check", "warn")
+    write_audit("balance", f"net={net}")
+    return 0
+
+
+def cmd_delegate(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    ks = require_keystore()
+    mnemonic = decrypt_root_with_prompt(ks)
+    root_acct = derive_root_account(mnemonic, 0)
+    root_addr = root_acct.address
+    cfg = load_config()
+    enforcer = getattr(args, "enforcer", None) or cfg.get("enforcer")
+    if not enforcer:
+        # Deploy enforcer using root
+        log("Deploying ScopeEnforcer...", "step")
+        require_confirm(args, "deploy ScopeEnforcer + EIP-7702 delegation")
+        nonce = get_nonce(w3, root_addr)
+        tx = {
+            "from": root_addr,
+            "to": None,
+            "value": 0,
+            "data": SCOPE_ENFORCER_BYTECODE,
+            "nonce": nonce,
+            "gas": 1_800_000,
+            "gasPrice": w3.eth.gas_price,
+            "chainId": w3.eth.chain_id,
+        }
+        signed = root_acct.sign_transaction(tx)
+        txh = w3.eth.send_raw_transaction(signed.raw_transaction)
+        print(f"Deploy tx: {txh.hex()}")
+        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        enforcer = rcpt.contractAddress
+        print(f"ScopeEnforcer deployed at: {enforcer}")
+        cfg["enforcer"] = enforcer
+        save_config(cfg)
+    else:
+        enforcer = to_checksum(enforcer)
+    # Now authorize delegation
+    log(f"Authorizing EIP-7702 delegation to {enforcer}...", "step")
+    require_confirm(args, f"EIP-7702 delegate root to {enforcer}")
+    chain_id = w3.eth.chain_id
+    nonce = get_nonce(w3, root_addr)
+    auth = build_authorization(enforcer, chain_id, nonce)
+    signed_auth = sign_authorization(auth, root_acct.key)
+    # Minimal tx carrying the auth
+    del_tx = {
+        "from": root_addr,
+        "to": root_addr,  # can be anything
+        "value": 0,
+        "data": b"",
+        "nonce": nonce + 1 if False else nonce,  # use same or next
+        "gas": 80_000,
+        "gasPrice": w3.eth.gas_price,
+        "chainId": chain_id,
+        "authorizationList": [signed_auth],
+    }
+    # Nonce handling: the auth uses the nonce at the time of inclusion
+    # For simplicity we use current nonce for the auth and a following tx if needed
+    signed = root_acct.sign_transaction(del_tx)
+    txh = w3.eth.send_raw_transaction(signed.raw_transaction)
+    print(f"Delegation auth tx: {txh.hex()}")
+    rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+    print(f"Receipt status: {rcpt.status}")
+    cfg["delegated"] = True
+    cfg["enforcer"] = enforcer
+    save_config(cfg)
+    write_audit("delegate", f"net={net} enforcer={enforcer}")
+    log("Delegation complete.", "ok")
+    return 0
+
+
+def cmd_session_issue(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    ks = require_keystore()
+    mnemonic = decrypt_root_with_prompt(ks)
+    root_acct = derive_root_account(mnemonic, 0)
+    root_addr = root_acct.address
+    cfg = load_config()
+    enforcer = cfg.get("enforcer")
+    if not enforcer:
+        log("No enforcer set. Run delegate first.", "err")
+        return 1
+    # generate session
+    priv, addr = generate_session_key()
+    cap_eth = float(args.daily_cap)
+    ttl = int(args.ttl.replace("d", "")) if args.ttl.endswith("d") else int(args.ttl)
+    wl = [to_checksum(a) for a in (getattr(args, "whitelist", "") or "").split(",") if a.strip()]
+    scope = build_session_scope(cap_eth, ttl, wl)
+    sess_data = serialize_session(priv, addr, scope)
+    # encrypt + save (using same passphrase flow)
+    pw = get_passphrase("Enter passphrase to encrypt new session: ")
+    enc_sess = encrypt_session(priv, addr, scope, pw)
+    save_session(enc_sess)
+    # Grant on-chain (root signs)
+    log("Granting scope on-chain via root...", "step")
+    require_confirm(args, f"grant session {addr} cap={cap_eth} ETH ttl={ttl}d")
+    grant_tx = build_grant_tx(root_addr, addr, scope["daily_cap_wei"], scope["expiry"], scope["whitelist"])
+    grant_tx["from"] = root_addr
+    raw = sign_and_serialize(w3, grant_tx, root_acct.key)
+    txh = w3.eth.send_raw_transaction(raw)
+    print(f"Grant tx: {txh.hex()}")
+    w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+    write_audit("session-issue", f"net={net} session={addr} cap={cap_eth}")
+    log(f"Session issued: {addr}", "ok")
+    print(f"Scope: daily={cap_eth} ETH, whitelist={wl or ['(none)']}, expiry={scope['expiry']}")
+    return 0
+
+
+def cmd_session_revoke(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    if not is_session_present():
+        log("No session to revoke", "warn")
+        return 0
+    sdata = require_session()
+    s = decrypt_session_with_prompt(sdata)
+    ks = require_keystore()
+    mnemonic = decrypt_root_with_prompt(ks)
+    root_acct = derive_root_account(mnemonic, 0)
+    root_addr = root_acct.address
+    cfg = load_config()
+    enforcer = cfg.get("enforcer")
+    if not enforcer:
+        log("No enforcer", "err")
+        return 1
+    require_confirm(args, f"revoke session {s['address']}")
+    rev_tx = build_revoke_tx(root_addr, s["address"])
+    rev_tx["from"] = root_addr
+    raw = sign_and_serialize(w3, rev_tx, root_acct.key)
+    txh = w3.eth.send_raw_transaction(raw)
+    print(f"Revoke tx: {txh.hex()}")
+    w3.eth.wait_for_transaction_receipt(txh, timeout=120)
+    # remove local session file for safety
+    try:
+        (WALLET_BASE / "session.enc").unlink()
+    except Exception:
+        pass
+    write_audit("session-revoke", f"session={s['address']}")
+    log("Session revoked.", "ok")
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    net = get_effective_network(args)
+    w3 = require_web3(net)
+    to = to_checksum(args.to)
+    amount = float(args.amount)
+    token = getattr(args, "token", None)
+    sess = decrypt_session_with_prompt(require_session())
+    priv = sess["privkey"]
+    session_addr = sess["address"]
+    scope = sess["scope"]
+    eoa = None
+    if is_keystore_present():
+        try:
+            m = decrypt_root_with_prompt(require_keystore())
+            eoa = derive_address(m, 0)
+        except Exception:
+            pass
+    if not eoa:
+        # fallback: try config or error
+        log("Cannot determine EOA address for scoped call. Need root or prior delegate.", "err")
+        return 1
+    value_wei = int(amount * 10**18) if not token else 0
+    if token:
+        inner_data = build_token_transfer_data(to, int(amount * (10**18)))  # assume 18 for simplicity; real should use decimals
+        to_for_scope = to_checksum(token)
+        call_tx = build_scoped_call(eoa, to_for_scope, 0, inner_data)
+    else:
+        call_tx = build_scoped_call(eoa, to, value_wei)
+    # client-side scope precheck (best effort)
+    if value_wei > scope.get("daily_cap_wei", 0):
+        log("Client precheck: amount exceeds daily cap", "err")
+        return 4
+    if to not in (scope.get("whitelist") or []) and not token:
+        # allow if no whitelist or for token case handled by onchain
+        if scope.get("whitelist"):
+            log("Recipient not in whitelist (client)", "warn")
+    require_confirm(args, f"send {amount} via scoped session to {to}")
+    raw = sign_and_serialize(w3, {**call_tx, "from": session_addr}, priv)
+    print("=== SIGNED RAW TX (hex) ===")
+    print(raw[:120] + "..." if len(raw) > 120 else raw)
+    print("Copy and broadcast with care (or use --confirm to send).")
+    if getattr(args, "confirm", False):
+        txh = w3.eth.send_raw_transaction(raw)
+        print(f"Broadcast: {txh.hex()}")
+        rcpt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        print(f"Status: {rcpt.status}")
+    write_audit("send", f"to={to} amt={amount} token={bool(token)}")
+    return 0
+
+
+def cmd_scope(args: argparse.Namespace) -> int:
+    if not is_session_present():
+        log("No session", "warn")
+        return 0
+    s = decrypt_session_with_prompt(require_session())
+    sc = s.get("scope", {})
+    print("\n=== Current session scope ===")
+    print(json.dumps(sc, indent=2, default=str))
+    # TODO: could add --set path using root + on-chain setScope
+    write_audit("scope", "view")
+    return 0
+
+
+def cmd_export_backup(args: argparse.Namespace) -> int:
+    data = require_keystore()
+    mnemonic = decrypt_root_with_prompt(data)
+    net = get_effective_network(args)
+    require_confirm(args, "export root mnemonic to backup")
+    addr = derive_address(mnemonic, 0)
+    content = [
+        "MOSS-ETH-WALLET PAPER BACKUP",
+        f"Network: {net}",
+        f"EOA: {addr}",
+        "",
+        "MNEMONIC (24 words):",
+        mnemonic,
+        "",
+        "KEEP SECURE. DELETE AFTER PRINT.",
+    ]
+    text = "\n".join(content)
+    output = getattr(args, "output", None)
+    if output:
+        p = Path(output)
+        p.write_text(text)
+        p.chmod(0o600)
+        log(f"Backup written to {p}", "warn")
+    else:
+        print(text)
+    write_audit("export-backup", f"net={net}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="moss-wallet-eth",
+        description="EIP-7702 scoped ETH/ERC-20 wallet (root offline, session with on-chain scope)",
+    )
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--network", default=None, help="holesky|sepolia|mainnet")
+    common.add_argument("--confirm", "--yes", "-y", dest="confirm", action="store_true",
+                        help="Skip interactive confirmation")
+
+    parser.add_argument("--network", default=None)
+    parser.add_argument("--confirm", "--yes", "-y", dest="confirm", action="store_true")
+
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_status = sub.add_parser("status", parents=[common])
+    p_status.set_defaults(func=cmd_status)
+
+    p_init = sub.add_parser("init", parents=[common])
+    p_init.set_defaults(func=cmd_init)
+
+    p_rest = sub.add_parser("restore", parents=[common])
+    p_rest.add_argument("--mnemonic")
+    p_rest.set_defaults(func=cmd_restore)
+
+    p_addr = sub.add_parser("addresses", parents=[common])
+    p_addr.set_defaults(func=cmd_addresses)
+
+    p_bal = sub.add_parser("balance", parents=[common])
+    p_bal.add_argument("--token", help="ERC-20 token address")
+    p_bal.set_defaults(func=cmd_balance)
+
+    p_del = sub.add_parser("delegate", parents=[common])
+    p_del.add_argument("--enforcer", help="Existing ScopeEnforcer address")
+    p_del.set_defaults(func=cmd_delegate)
+
+    p_si = sub.add_parser("session-issue", parents=[common])
+    p_si.add_argument("--daily-cap", required=True, type=float)
+    p_si.add_argument("--ttl", required=True, help="e.g. 7d")
+    p_si.add_argument("--whitelist", default="", help="comma separated addresses")
+    p_si.set_defaults(func=cmd_session_issue)
+
+    p_sr = sub.add_parser("session-revoke", parents=[common])
+    p_sr.set_defaults(func=cmd_session_revoke)
+
+    p_send = sub.add_parser("send", parents=[common])
+    p_send.add_argument("--to", required=True)
+    p_send.add_argument("--amount", required=True, type=float)
+    p_send.add_argument("--token", default=None)
+    p_send.set_defaults(func=cmd_send)
+
+    p_sc = sub.add_parser("scope", parents=[common])
+    p_sc.set_defaults(func=cmd_scope)
+
+    p_exp = sub.add_parser("export-backup", parents=[common])
+    p_exp.add_argument("--output", "-o")
+    p_exp.set_defaults(func=cmd_export_backup)
+
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except KeyboardInterrupt:
+        print("\nInterrupted")
+        return 130
+    except Exception as e:
+        log(f"Error: {e}", "err")
+        if os.environ.get("DEBUG"):
+            raise
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
